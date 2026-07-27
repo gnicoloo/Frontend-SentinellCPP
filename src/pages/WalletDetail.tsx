@@ -155,6 +155,18 @@ export default function WalletDetail() {
     [profile, peers],
   )
 
+  /**
+   * The sub-scores exist in the engine (WalletTracker::breakdown_json) but
+   * serialize_profile() does not embed them, so /wallet_snapshot -- and every
+   * `wallets.profile` downstream -- omits them. Absent that, the radar would
+   * draw a flat zero octagon and a peer median of zero, which reads as a
+   * measurement rather than as missing data. Detect it and say so instead.
+   */
+  const hasSubScores = useMemo(
+    () => SUB_SCORES.some((s) => typeof profile[s.key] === 'number'),
+    [profile],
+  )
+
   const winRate = wallet && wallet.trades_count > 0 ? wallet.win_count / wallet.trades_count : 0
   const threat = wallet ? Math.min(1, wallet.suspicious_score / 10) : 0
   const sev = severityOf(threat)
@@ -434,13 +446,26 @@ export default function WalletDetail() {
           {wallet && (
             <Panel
               title="Behavioral vector"
-              meta="wallet vs peer median"
+              meta={hasSubScores ? 'wallet vs peer median' : 'unavailable'}
               loading={loading}
-              table={{
+              table={hasSubScores ? {
                 columns: ['Axis', 'Wallet', 'Peer median'],
                 rows: radarData.map((d) => [d.subject, d.wallet.toFixed(2), d.peer.toFixed(2)]),
-              }}
+              } : undefined}
             >
+              {!hasSubScores ? (
+                <div className="px-3 py-6">
+                  <p className="font-mono text-[10px] uppercase leading-relaxed text-slate-500">
+                    ⚠ sub-scores absent from <span className="text-slate-300">wallets.profile</span>
+                  </p>
+                  <p className="mt-2 font-mono text-[9px] uppercase leading-relaxed text-slate-600">
+                    the engine computes them (WalletTracker::breakdown_json) but
+                    serialize_profile() does not embed them, so /wallet_snapshot
+                    never ships them. drawing the chart here would show a flat
+                    zero octagon that looks like a measured result.
+                  </p>
+                </div>
+              ) : (
               <div className="p-3">
                 <div className="h-56">
                   <ResponsiveContainer width="100%" height="100%">
@@ -481,6 +506,7 @@ export default function WalletDetail() {
                   />
                 </div>
               </div>
+              )}
             </Panel>
           )}
 
