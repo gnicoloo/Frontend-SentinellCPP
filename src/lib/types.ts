@@ -35,6 +35,7 @@ export const ALERT_TYPE_LABELS: Record<string, string> = {
   twap_pattern: 'TWAP Pattern',
   deception_alert: 'Deception',
   cluster_move: 'Cluster Move',
+  wallet_alert: 'Wallet/Hot',
 }
 
 export const ALERT_TYPE_COLORS: Record<string, string> = {
@@ -43,6 +44,7 @@ export const ALERT_TYPE_COLORS: Record<string, string> = {
   twap_pattern: '#38bdf8',
   deception_alert: '#fbbf24',
   cluster_move: '#34d399',
+  wallet_alert: '#fb923c',
 }
 
 export function shortAddress(address: string | null | undefined): string {
