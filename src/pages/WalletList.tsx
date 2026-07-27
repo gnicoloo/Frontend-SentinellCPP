@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
 import { useRange } from '../context/RangeProvider'
 import { bucketize } from '../lib/range'
-import { shortAddress, type WalletRow } from '../lib/types'
+import { shortAddress, type PositionRow, type WalletRow } from '../lib/types'
 import { SERIES, STATUS } from '../lib/theme'
 import { compact, percentileOf, pct, usd } from '../lib/format'
 import { quantile } from '../lib/stats'
@@ -12,9 +12,10 @@ import Panel from '../components/viz/Panel'
 import Histogram from '../components/viz/Histogram'
 import MiniBar from '../components/viz/MiniBar'
 import Sparkline from '../components/viz/Sparkline'
+import Signed from '../components/viz/Signed'
 
 type SortKey =
-  | 'flow' | 'info_score' | 'suspicious_score' | 'forensic_score'
+  | 'flow' | 'notional' | 'unrealized' | 'info_score' | 'suspicious_score' | 'forensic_score'
   | 'roi_estimate' | 'win_rate' | 'trades_count' | 'total_volume' | 'total_profit'
 
 interface Column {
@@ -27,6 +28,11 @@ interface Column {
   hideOnMobile?: boolean
   /** Domain max for the bar; null means "scale to the visible max". */
   max?: number
+  /**
+   * Set on signed measures. Formats the magnitude; the direction glyph and
+   * color come from <Signed>, so the sign never rests on color alone.
+   */
+  abs?: (v: number) => string
 }
 
 interface Screened extends WalletRow {
@@ -34,26 +40,34 @@ interface Screened extends WalletRow {
   series: number[]
   win_rate: number
   info_pctl: number
+  /** Live capital at risk, summed from `positions`. */
+  notional: number
+  unrealized: number
 }
 
 const COLUMNS: Column[] = [
   { key: 'flow', label: 'Flow', format: (w) => compact(w.flow) },
+  { key: 'notional', label: 'At risk', format: (w) => usd(w.notional) },
+  { key: 'unrealized', label: 'Unreal.', format: (w) => usd(w.unrealized), abs: usd },
   { key: 'info_score', label: 'Info', format: (w) => w.info_score.toFixed(1), bar: true, max: 100 },
   { key: 'suspicious_score', label: 'Susp', format: (w) => w.suspicious_score.toFixed(2), bar: true, max: 10 },
   { key: 'forensic_score', label: 'Forensic', format: (w) => w.forensic_score.toFixed(2), bar: true, max: 10, hideOnMobile: true },
-  { key: 'roi_estimate', label: 'ROI', format: (w) => pct(w.roi_estimate) },
+  { key: 'roi_estimate', label: 'ROI', format: (w) => pct(w.roi_estimate), abs: (v) => pct(v) },
   { key: 'win_rate', label: 'Win', format: (w) => pct(w.win_rate), hideOnMobile: true },
   { key: 'trades_count', label: 'TX', format: (w) => compact(w.trades_count), hideOnMobile: true },
   { key: 'total_volume', label: 'Volume', format: (w) => usd(w.total_volume) },
-  { key: 'total_profit', label: 'P&L', format: (w) => usd(w.total_profit), hideOnMobile: true },
+  { key: 'total_profit', label: 'P&L', format: (w) => usd(w.total_profit), hideOnMobile: true, abs: usd },
 ]
 
 const ROW_CAP = 6000
+
+type PositionSlice = Pick<PositionRow, 'wallet_address' | 'notional_usd' | 'unrealized_pnl'>
 
 export default function WalletList() {
   const { def, key: rangeKey, nonce, start, end } = useRange()
   const [wallets, setWallets] = useState<WalletRow[]>([])
   const [flowRows, setFlowRows] = useState<{ wallet_address: string | null; timestamp_ms: number | null }[]>([])
+  const [positions, setPositions] = useState<PositionSlice[]>([])
   const [search, setSearch] = useState('')
   const [sortKey, setSortKey] = useState<SortKey>('info_score')
   const [desc, setDesc] = useState(true)
@@ -65,7 +79,7 @@ export default function WalletList() {
     let cancelled = false
     const load = async () => {
       setLoading(true)
-      const [walletRes, flowRes] = await Promise.all([
+      const [walletRes, flowRes, posRes] = await Promise.all([
         supabase.from('wallets').select('*').order('info_score', { ascending: false }).limit(500),
         supabase
           .from('alerts')
@@ -74,10 +88,13 @@ export default function WalletList() {
           .gte('timestamp_ms', start)
           .lte('timestamp_ms', end)
           .limit(ROW_CAP),
+        // Exposure is a live snapshot, not a windowed series: no time filter.
+        supabase.from('positions').select('wallet_address, notional_usd, unrealized_pnl').limit(ROW_CAP),
       ])
       if (cancelled) return
       setWallets((walletRes.data as WalletRow[]) ?? [])
       setFlowRows((flowRes.data as { wallet_address: string | null; timestamp_ms: number | null }[]) ?? [])
+      setPositions((posRes.data as PositionSlice[]) ?? [])
       setLoading(false)
     }
     void load()
@@ -92,18 +109,28 @@ export default function WalletList() {
       if (list) list.push(r)
       else byWallet.set(r.wallet_address, [r])
     }
+    const book = new Map<string, { notional: number; unrealized: number }>()
+    for (const p of positions) {
+      const acc = book.get(p.wallet_address) ?? { notional: 0, unrealized: 0 }
+      acc.notional += p.notional_usd
+      acc.unrealized += p.unrealized_pnl
+      book.set(p.wallet_address, acc)
+    }
     const infoPop = wallets.map((w) => w.info_score).sort((a, b) => a - b)
     return wallets.map((w) => {
       const events = byWallet.get(w.address) ?? []
+      const exposure = book.get(w.address)
       return {
         ...w,
         flow: events.length,
         series: bucketize(events, (r) => r.timestamp_ms, () => 'v', def, start, end).map((b) => b.total),
         win_rate: w.trades_count > 0 ? w.win_count / w.trades_count : 0,
         info_pctl: percentileOf(w.info_score, infoPop),
+        notional: exposure?.notional ?? 0,
+        unrealized: exposure?.unrealized ?? 0,
       }
     })
-  }, [wallets, flowRows, def, start, end])
+  }, [wallets, flowRows, positions, def, start, end])
 
   const filtered = useMemo(() => {
     const needle = search.trim().toLowerCase()
@@ -239,14 +266,9 @@ export default function WalletList() {
                                 title={`${c.label} ${c.format(w)}`}
                               />
                             )}
-                            <span style={c.key === 'roi_estimate' || c.key === 'total_profit'
-                              ? { color: raw > 0 ? STATUS.good : raw < 0 ? STATUS.critical : undefined }
-                              : undefined}
-                            >
-                              {(c.key === 'roi_estimate' || c.key === 'total_profit') && raw !== 0
-                                ? `${raw > 0 ? '▲' : '▼'} ${c.format(w).replace('-', '')}`
-                                : c.format(w)}
-                            </span>
+                            {c.abs
+                              ? <Signed value={raw} format={c.abs} />
+                              : <span>{c.format(w)}</span>}
                           </span>
                         </td>
                       )

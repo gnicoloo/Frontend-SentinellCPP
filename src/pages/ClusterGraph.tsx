@@ -3,106 +3,42 @@ import { useNavigate } from 'react-router-dom'
 import * as d3 from 'd3'
 import { supabase } from '../lib/supabaseClient'
 import { useRange } from '../context/RangeProvider'
-import { shortAddress, type AlertRow } from '../lib/types'
-import { INK, RAMP, rampStep } from '../lib/theme'
-import { compact } from '../lib/format'
+import { outcomeColor, shortAddress, type ClusterLeg, type ClusterRow, type PositionRow } from '../lib/types'
+import { INK, RAMP, SERIES, rampStep } from '../lib/theme'
+import { ago, compact, usd } from '../lib/format'
 import FilterBar from '../components/FilterBar'
 import Panel from '../components/viz/Panel'
+import StatTile from '../components/viz/StatTile'
+import MiniBar from '../components/viz/MiniBar'
+import Signed from '../components/viz/Signed'
+import ExposureTable, { type ExposureRow } from '../components/viz/ExposureTable'
 
 interface GraphNode extends d3.SimulationNodeDatum {
   id: string
-  cluster: number
-  alerts: number
-  /** 0..1 share of the busiest node -- drives the ordinal color ramp. */
+  cluster: string
+  clusterIndex: number
+  /** This member's own capital at risk, from `positions`. */
+  notional: number
+  /** 0..1 against the busiest member -- drives the ordinal ramp. */
   intensity: number
+  isAnchor: boolean
 }
 interface GraphLink extends d3.SimulationLinkDatum<GraphNode> {
-  weight: number
+  cluster: string
 }
 
-type EdgeRow = Pick<AlertRow, 'wallet_address' | 'asset_id' | 'alert_type' | 'timestamp_ms'>
-
-const HEIGHT = 560
-const NODE_CAP = 300
-
-function buildGraph(alerts: EdgeRow[], minWeight: number): { nodes: GraphNode[]; links: GraphLink[] } {
-  const byAsset = new Map<string, Set<string>>()
-  const counts = new Map<string, number>()
-  for (const a of alerts) {
-    if (!a.wallet_address || !a.asset_id) continue
-    if (!byAsset.has(a.asset_id)) byAsset.set(a.asset_id, new Set())
-    byAsset.get(a.asset_id)!.add(a.wallet_address)
-    counts.set(a.wallet_address, (counts.get(a.wallet_address) ?? 0) + 1)
-  }
-
-  const linkWeights = new Map<string, number>()
-  for (const wallets of byAsset.values()) {
-    const list = [...wallets]
-    for (let i = 0; i < list.length; i++) {
-      for (let j = i + 1; j < list.length && j < i + 16; j++) {
-        const key = list[i] < list[j] ? `${list[i]}|${list[j]}` : `${list[j]}|${list[i]}`
-        linkWeights.set(key, (linkWeights.get(key) ?? 0) + 1)
-      }
-    }
-  }
-
-  // A co-occurrence floor is the analyst's main lever: one shared market is
-  // noise, four is a relationship.
-  const edges = [...linkWeights.entries()].filter(([, w]) => w >= minWeight)
-
-  const connected = new Set<string>()
-  for (const [key] of edges) {
-    const [a, b] = key.split('|')
-    connected.add(a)
-    connected.add(b)
-  }
-  if (connected.size === 0) return { nodes: [], links: [] }
-
-  const parent = new Map<string, string>()
-  const find = (x: string): string => {
-    let root = x
-    while (parent.get(root) !== root) root = parent.get(root)!
-    return root
-  }
-  for (const w of connected) parent.set(w, w)
-  for (const [key] of edges) {
-    const [a, b] = key.split('|')
-    parent.set(find(a), find(b))
-  }
-
-  const maxAlerts = Math.max(1, ...[...connected].map((id) => counts.get(id) ?? 1))
-  const clusterIds = new Map<string, number>()
-  const nodes: GraphNode[] = [...connected]
-    .sort((a, b) => (counts.get(b) ?? 0) - (counts.get(a) ?? 0))
-    .slice(0, NODE_CAP)
-    .map((id) => {
-      const root = find(id)
-      if (!clusterIds.has(root)) clusterIds.set(root, clusterIds.size)
-      const alerts = counts.get(id) ?? 1
-      return { id, cluster: clusterIds.get(root)!, alerts, intensity: alerts / maxAlerts }
-    })
-
-  const nodeSet = new Set(nodes.map((n) => n.id))
-  const links: GraphLink[] = edges
-    .filter(([key]) => {
-      const [a, b] = key.split('|')
-      return nodeSet.has(a) && nodeSet.has(b)
-    })
-    .map(([key, weight]) => {
-      const [a, b] = key.split('|')
-      return { source: a, target: b, weight }
-    })
-
-  return { nodes, links }
-}
+const HEIGHT = 520
+const NODE_CAP = 400
 
 export default function ClusterGraph() {
   const svgRef = useRef<SVGSVGElement>(null)
   const navigate = useNavigate()
-  const { def, key: rangeKey, nonce, start, end } = useRange()
+  const { nonce } = useRange()
 
-  const [alerts, setAlerts] = useState<EdgeRow[]>([])
-  const [minWeight, setMinWeight] = useState(1)
+  const [clusters, setClusters] = useState<ClusterRow[]>([])
+  const [positions, setPositions] = useState<Pick<PositionRow, 'wallet_address' | 'notional_usd'>[]>([])
+  const [selected, setSelected] = useState<string | null>(null)
+  const [minWallets, setMinWallets] = useState(2)
   const [loading, setLoading] = useState(true)
   const [hover, setHover] = useState<{ x: number; y: number; node: GraphNode } | null>(null)
 
@@ -110,38 +46,93 @@ export default function ClusterGraph() {
     let cancelled = false
     const load = async () => {
       setLoading(true)
-      const { data } = await supabase
-        .from('alerts')
-        .select('wallet_address, asset_id, alert_type, timestamp_ms')
-        .not('wallet_address', 'is', null)
-        .gte('timestamp_ms', start)
-        .lte('timestamp_ms', end)
-        .limit(6000)
+      // The backend owns cluster membership now (GET /clusters -> ClusterTracker).
+      // Deriving it here from alert co-occurrence would be a weaker guess that
+      // disagrees with the engine's own numbers.
+      const [clusterRes, posRes] = await Promise.all([
+        supabase.from('clusters').select('*').order('total_notional_usd', { ascending: false }).limit(200),
+        supabase.from('positions').select('wallet_address, notional_usd').limit(5000),
+      ])
       if (cancelled) return
-      setAlerts((data as EdgeRow[]) ?? [])
+      setClusters((clusterRes.data as ClusterRow[]) ?? [])
+      setPositions((posRes.data as Pick<PositionRow, 'wallet_address' | 'notional_usd'>[]) ?? [])
       setLoading(false)
     }
     void load()
     return () => { cancelled = true }
-  }, [rangeKey, nonce, start, end])
+  }, [nonce])
 
-  const graph = useMemo(() => buildGraph(alerts, minWeight), [alerts, minWeight])
-
-  const clusters = useMemo(() => {
-    const map = new Map<number, GraphNode[]>()
-    for (const n of graph.nodes) {
-      if (!map.has(n.cluster)) map.set(n.cluster, [])
-      map.get(n.cluster)!.push(n)
+  const notionalByWallet = useMemo(() => {
+    const map = new Map<string, number>()
+    for (const p of positions) {
+      map.set(p.wallet_address, (map.get(p.wallet_address) ?? 0) + p.notional_usd)
     }
-    return [...map.entries()]
-      .map(([id, members]) => ({
-        id,
-        size: members.length,
-        alerts: members.reduce((s, m) => s + m.alerts, 0),
-        members: members.sort((a, b) => b.alerts - a.alerts),
-      }))
-      .sort((a, b) => b.alerts - a.alerts)
-  }, [graph])
+    return map
+  }, [positions])
+
+  const visible = useMemo(
+    () => clusters.filter((c) => c.wallet_count >= minWallets),
+    [clusters, minWallets],
+  )
+
+  const totals = useMemo(() => ({
+    notional: visible.reduce((s, c) => s + c.total_notional_usd, 0),
+    unrealized: visible.reduce((s, c) => s + c.unrealized_pnl, 0),
+    realized: visible.reduce((s, c) => s + c.realized_pnl, 0),
+    wallets: new Set(visible.flatMap((c) => c.wallets ?? [])).size,
+    withPositions: visible.reduce((s, c) => s + c.wallets_with_positions, 0),
+    markets: visible.reduce((s, c) => s + c.market_count, 0),
+  }), [visible])
+
+  const graph = useMemo(() => {
+    const nodes: GraphNode[] = []
+    const links: GraphLink[] = []
+    const maxNotional = Math.max(1, ...[...notionalByWallet.values()])
+
+    visible.forEach((c, clusterIndex) => {
+      const members = (c.wallets ?? []).slice(0, 60)
+      if (members.length === 0) return
+      const anchor = c.cluster_key
+      for (const id of members) {
+        if (nodes.length >= NODE_CAP) break
+        const notional = notionalByWallet.get(id) ?? 0
+        nodes.push({
+          id,
+          cluster: c.cluster_key,
+          clusterIndex,
+          notional,
+          intensity: notional / maxNotional,
+          isAnchor: id === anchor,
+        })
+        // Membership is the relation the engine asserts. A star from the
+        // cluster key states exactly that, without inventing pairwise edges
+        // (and without the O(n^2) mesh a full clique would draw).
+        if (id !== anchor) links.push({ source: anchor, target: id, cluster: c.cluster_key })
+      }
+    })
+
+    const present = new Set(nodes.map((n) => n.id))
+    return { nodes, links: links.filter((l) => present.has(l.source as string) && present.has(l.target as string)) }
+  }, [visible, notionalByWallet])
+
+  const active = useMemo(
+    () => visible.find((c) => c.cluster_key === selected) ?? visible[0] ?? null,
+    [visible, selected],
+  )
+
+  const legRows = useMemo<ExposureRow[]>(() => {
+    const legs: ClusterLeg[] = active?.legs ?? []
+    return legs.map((l, i) => ({
+      id: `${l.asset_id}-${i}`,
+      market: l.market_title || l.asset_id,
+      outcome: l.outcome,
+      netContracts: l.net_contracts,
+      notional: l.notional_usd,
+      avgEntry: l.avg_entry_price,
+      holders: l.wallets,
+      href: l.market_title ? `/alerts?market=${encodeURIComponent(l.market_title)}` : undefined,
+    }))
+  }, [active])
 
   useEffect(() => {
     const svg = d3.select(svgRef.current)
@@ -158,12 +149,12 @@ export default function ClusterGraph() {
 
     const simulation = d3
       .forceSimulation<GraphNode>(graph.nodes)
-      .force('link', d3.forceLink<GraphNode, GraphLink>(graph.links).id((d) => d.id).distance(70).strength(0.4))
-      .force('charge', d3.forceManyBody().strength(-140))
+      .force('link', d3.forceLink<GraphNode, GraphLink>(graph.links).id((d) => d.id).distance(46).strength(0.7))
+      .force('charge', d3.forceManyBody().strength(-130))
       .force('center', d3.forceCenter(width / 2, HEIGHT / 2))
-      .force('collide', d3.forceCollide(20))
+      .force('collide', d3.forceCollide(18))
 
-    const radius = (d: GraphNode) => 5 + Math.sqrt(d.alerts) * 2.4
+    const radius = (d: GraphNode) => (d.isAnchor ? 7 : 5) + Math.sqrt(d.notional) / 14
 
     const link = container
       .append('g')
@@ -171,8 +162,8 @@ export default function ClusterGraph() {
       .data(graph.links)
       .join('line')
       .attr('stroke', INK.axis)
-      .attr('stroke-opacity', 0.7)
-      .attr('stroke-width', (d) => Math.min(3, 0.6 + d.weight * 0.4))
+      .attr('stroke-opacity', 0.6)
+      .attr('stroke-width', 1)
 
     const node = container
       .append('g')
@@ -180,18 +171,31 @@ export default function ClusterGraph() {
       .data(graph.nodes)
       .join('circle')
       .attr('r', radius)
-      // Magnitude is a single-hue ordinal ramp, never a categorical carousel:
-      // cluster membership is carried by position, size by alert count.
+      // Magnitude is a single-hue ordinal ramp; membership is carried by
+      // position and by the anchor ring, never by a cycled categorical hue.
       .attr('fill', (d) => rampStep(d.intensity))
-      .attr('stroke', INK.surface)
+      .attr('stroke', (d) => (d.cluster === active?.cluster_key ? '#e2e8f0' : INK.surface))
       .attr('stroke-width', 2)
+      .style('cursor', 'pointer')
+
+    const hit = container
+      .append('g')
+      .selectAll<SVGCircleElement, GraphNode>('circle')
+      .data(graph.nodes)
+      .join('circle')
+      .attr('r', (d) => Math.max(12, radius(d) + 6))
+      .attr('fill', 'transparent')
       .style('cursor', 'pointer')
       .on('pointerenter', (event: PointerEvent, d) => {
         const rect = svgRef.current!.getBoundingClientRect()
         setHover({ x: event.clientX - rect.left, y: event.clientY - rect.top, node: d })
       })
       .on('pointerleave', () => setHover(null))
-      .on('click', (_e, d) => navigate(`/wallet/${d.id}`))
+      .on('click', (event: MouseEvent, d) => {
+        // Click selects the cluster; shift-click jumps to the wallet.
+        if (event.shiftKey) navigate(`/wallet/${d.id}`)
+        else setSelected(d.cluster)
+      })
       .call(
         d3.drag<SVGCircleElement, GraphNode>()
           .on('start', (event, d) => {
@@ -207,31 +211,10 @@ export default function ClusterGraph() {
           }) as never,
       )
 
-    // A transparent halo so a 10px node still has a ~24px hit target.
-    container
-      .append('g')
-      .selectAll<SVGCircleElement, GraphNode>('circle')
-      .data(graph.nodes)
-      .join('circle')
-      .attr('r', (d) => Math.max(12, radius(d) + 6))
-      .attr('fill', 'transparent')
-      .style('cursor', 'pointer')
-      .on('pointerenter', (event: PointerEvent, d) => {
-        const rect = svgRef.current!.getBoundingClientRect()
-        setHover({ x: event.clientX - rect.left, y: event.clientY - rect.top, node: d })
-      })
-      .on('pointerleave', () => setHover(null))
-      .on('click', (_e, d) => navigate(`/wallet/${d.id}`))
-      .attr('class', 'halo')
-
-    // Only the busiest nodes get a direct label -- labelling all 300 is chaos.
-    const labelled = new Set(
-      [...graph.nodes].sort((a, b) => b.alerts - a.alerts).slice(0, 12).map((n) => n.id),
-    )
     const label = container
       .append('g')
       .selectAll('text')
-      .data(graph.nodes.filter((n) => labelled.has(n.id)))
+      .data(graph.nodes.filter((n) => n.isAnchor))
       .join('text')
       .text((d) => shortAddress(d.id))
       .attr('font-size', 9)
@@ -246,43 +229,144 @@ export default function ClusterGraph() {
         .attr('x2', (d) => (d.target as GraphNode).x ?? 0)
         .attr('y2', (d) => (d.target as GraphNode).y ?? 0)
       node.attr('cx', (d) => d.x ?? 0).attr('cy', (d) => d.y ?? 0)
-      container.selectAll<SVGCircleElement, GraphNode>('.halo')
-        .attr('cx', (d) => d.x ?? 0).attr('cy', (d) => d.y ?? 0)
+      hit.attr('cx', (d) => d.x ?? 0).attr('cy', (d) => d.y ?? 0)
       label.attr('x', (d) => (d.x ?? 0) + radius(d) + 4).attr('y', (d) => (d.y ?? 0) + 3)
     })
 
     return () => { simulation.stop() }
-  }, [graph, navigate])
+  }, [graph, navigate, active?.cluster_key])
+
+  const maxClusterNotional = Math.max(1, ...visible.map((c) => c.total_notional_usd))
 
   return (
     <div>
-      <FilterBar title="CO-TRADING NETWORK">
+      <FilterBar title="CLUSTER BOOK" showRange={false}>
         <label className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-wider text-slate-500">
-          min shared markets
+          min members
           <input
             type="range"
-            min={1}
-            max={6}
-            value={minWeight}
-            onChange={(e) => setMinWeight(Number(e.target.value))}
+            min={2}
+            max={10}
+            value={minWallets}
+            onChange={(e) => setMinWallets(Number(e.target.value))}
             className="w-24 accent-[#22C55E]"
           />
-          <span className="num w-3 text-slate-200">{minWeight}</span>
+          <span className="num w-3 text-slate-200">{minWallets}</span>
         </label>
         <span className="num font-mono text-[10px] uppercase text-slate-600">
-          {compact(graph.nodes.length)} nodes · {compact(graph.links.length)} edges · {clusters.length} clusters
+          {compact(visible.length)} clusters · {compact(totals.wallets)} wallets
         </span>
       </FilterBar>
 
-      <div className="grid gap-3 xl:grid-cols-4">
+      <div className="space-y-3">
+        <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-5">
+          <StatTile label="Combined capital at risk" accent={SERIES[0]} value={usd(totals.notional)} footnote={`${visible.length} clusters`} />
+          <StatTile label="Unrealized P&L" accent={SERIES[1]} value={usd(totals.unrealized)} footnote={totals.unrealized >= 0 ? '▲ in profit' : '▼ in loss'} />
+          <StatTile label="Realized P&L" accent={SERIES[2]} value={usd(totals.realized)} footnote="closed legs" />
+          <StatTile label="Wallets clustered" accent={SERIES[3]} value={compact(totals.wallets)} footnote={`${compact(totals.withPositions)} with a book`} />
+          <StatTile label="Market legs" accent={SERIES[5]} value={compact(totals.markets)} footnote="across all clusters" />
+        </div>
+
+        {!loading && clusters.length === 0 && (
+          <p className="border border-sentinel-border bg-sentinel-panel px-3 py-2 font-mono text-[10px] uppercase text-slate-500">
+            clusters table empty — run a sync pass with the sentinel metrics endpoint reachable
+          </p>
+        )}
+
+        <div className="grid gap-3 xl:grid-cols-3">
+          <Panel
+            title="Clusters by capital"
+            meta="click to inspect the book"
+            loading={loading}
+            table={{
+              columns: ['Cluster', 'Wallets', 'Markets', 'Notional', 'Unrealized', 'Realized'],
+              rows: visible.map((c) => [
+                shortAddress(c.cluster_key), c.wallet_count, c.market_count,
+                c.total_notional_usd.toFixed(2), c.unrealized_pnl.toFixed(2), c.realized_pnl.toFixed(2),
+              ]),
+            }}
+          >
+            <ul className="max-h-[460px] divide-y divide-sentinel-border/40 overflow-y-auto">
+              {visible.length === 0 && (
+                <li className="px-3 py-4 font-mono text-[10px] uppercase text-slate-600">no cluster with {minWallets}+ members</li>
+              )}
+              {visible.map((c) => (
+                <li key={c.cluster_key}>
+                  <button
+                    onClick={() => setSelected(c.cluster_key)}
+                    aria-pressed={active?.cluster_key === c.cluster_key}
+                    className={`w-full px-3 py-2 text-left transition-colors ${
+                      active?.cluster_key === c.cluster_key ? 'bg-sentinel-accent/10' : 'hover:bg-white/[0.03]'
+                    }`}
+                  >
+                    <div className="flex items-baseline gap-2">
+                      <span className="font-mono text-[11px] text-slate-100">{shortAddress(c.cluster_key)}</span>
+                      <span className="font-mono text-[9px] uppercase text-slate-600">
+                        {c.wallet_count} wlt · {c.market_count} mkt
+                      </span>
+                      <span className="num ml-auto text-[11px] font-semibold text-slate-100">{usd(c.total_notional_usd)}</span>
+                    </div>
+                    <div className="mt-1 flex items-center gap-2">
+                      <MiniBar value={c.total_notional_usd / maxClusterNotional} color={SERIES[0]} width={72} />
+                      <Signed className="num text-[10px]" value={c.unrealized_pnl} format={usd} />
+                      <span className="ml-auto font-mono text-[9px] uppercase text-slate-600">
+                        {c.wallets_with_positions}/{c.wallet_count} with book
+                      </span>
+                    </div>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </Panel>
+
+          <Panel
+            className="xl:col-span-2"
+            title={active ? `Combined book · ${shortAddress(active.cluster_key)}` : 'Combined book'}
+            meta={
+              active
+                ? `${active.wallet_count} wallets · ${compact(active.gross_contracts)} gross contracts · updated ${ago(new Date(active.updated_at).getTime())} ago`
+                : 'select a cluster'
+            }
+            loading={loading}
+            table={{
+              columns: ['Market', 'Outcome', 'Holders', 'Net contracts', 'Notional', 'Avg entry'],
+              rows: (active?.legs ?? []).map((l) => [
+                l.market_title || l.asset_id, l.outcome, l.wallets,
+                l.net_contracts.toFixed(2), l.notional_usd.toFixed(2), l.avg_entry_price.toFixed(4),
+              ]),
+            }}
+          >
+            <ExposureTable
+              rows={legRows}
+              showMark={false}
+              maxHeight={200}
+              emptyLabel={active ? 'cluster holds no open legs' : 'select a cluster'}
+            />
+            {active && (
+              <div className="flex flex-wrap gap-x-4 gap-y-1 border-t border-sentinel-border px-3 py-2 font-mono text-[10px] uppercase text-slate-500">
+                <span>members:</span>
+                {(active.wallets ?? []).slice(0, 12).map((w) => (
+                  <button
+                    key={w}
+                    onClick={() => navigate(`/wallet/${w}`)}
+                    className="text-sentinel-accent hover:underline"
+                  >
+                    {shortAddress(w)}
+                  </button>
+                ))}
+                {(active.wallets?.length ?? 0) > 12 && <span className="text-slate-700">+{active.wallets.length - 12} more</span>}
+              </div>
+            )}
+          </Panel>
+        </div>
+
         <Panel
-          className="xl:col-span-3"
-          title="Network"
-          meta={`${def.label} · edge = shared market · size = alert count`}
+          title="Membership network"
+          meta="edge = same cluster · size = wallet capital at risk"
           loading={loading}
           actions={
-            <span className="hidden items-center gap-1.5 font-mono text-[9px] uppercase text-slate-600 sm:flex">
-              scroll zoom · drag node · click to open
+            <span className="hidden font-mono text-[9px] uppercase text-slate-600 sm:inline">
+              click = select cluster · shift+click = open wallet
             </span>
           }
         >
@@ -291,24 +375,25 @@ export default function ClusterGraph() {
 
             {graph.nodes.length === 0 && !loading && (
               <p className="absolute inset-0 flex items-center justify-center font-mono text-[10px] uppercase text-slate-600">
-                no co-trading pairs in {def.label} at ≥{minWeight} shared market{minWeight > 1 ? 's' : ''}
+                no cluster with {minWallets}+ members
               </p>
             )}
 
             {hover && (
               <div
                 className="pointer-events-none absolute z-10 border border-sentinel-border bg-sentinel-bg px-2 py-1.5 shadow-xl"
-                style={{ left: Math.min(hover.x + 12, 640), top: hover.y + 12 }}
+                style={{ left: Math.min(hover.x + 12, 620), top: hover.y + 12 }}
               >
-                <p className="num text-[11px] font-semibold text-slate-100">{hover.node.alerts} alerts</p>
+                <p className="num text-[11px] font-semibold text-slate-100">{usd(hover.node.notional)}</p>
                 <p className="font-mono text-[10px] text-slate-400">{shortAddress(hover.node.id)}</p>
-                <p className="font-mono text-[9px] uppercase text-slate-600">cluster {hover.node.cluster + 1}</p>
+                <p className="font-mono text-[9px] uppercase text-slate-600">
+                  {hover.node.isAnchor ? 'cluster anchor' : 'member'} · {shortAddress(hover.node.cluster)}
+                </p>
               </div>
             )}
 
-            {/* Scale legend: the ramp encodes magnitude, so it needs a key. */}
             <div className="absolute bottom-2 left-2 flex items-center gap-1.5 border border-sentinel-border bg-sentinel-panel/90 px-2 py-1">
-              <span className="font-mono text-[9px] uppercase tracking-wider text-slate-500">alerts</span>
+              <span className="font-mono text-[9px] uppercase tracking-wider text-slate-500">capital</span>
               <span className="font-mono text-[9px] text-slate-600">low</span>
               {RAMP.map((c) => <span key={c} className="inline-block h-2 w-4" style={{ background: c }} />)}
               <span className="font-mono text-[9px] text-slate-600">high</span>
@@ -316,43 +401,14 @@ export default function ClusterGraph() {
           </div>
         </Panel>
 
-        <Panel
-          title="Clusters"
-          meta={`ranked by flow`}
-          loading={loading}
-          table={{
-            columns: ['Cluster', 'Wallets', 'Alerts'],
-            rows: clusters.map((c) => [`C${c.id + 1}`, c.size, c.alerts]),
-          }}
-        >
-          <ul className="max-h-[540px] divide-y divide-sentinel-border/40 overflow-y-auto">
-            {clusters.length === 0 && <li className="px-3 py-4 font-mono text-[10px] uppercase text-slate-600">no clusters</li>}
-            {clusters.map((c) => (
-              <li key={c.id} className="px-3 py-2">
-                <div className="flex items-baseline gap-2">
-                  <span className="font-mono text-[11px] font-bold text-slate-100">C{c.id + 1}</span>
-                  <span className="font-mono text-[9px] uppercase text-slate-600">{c.size} wallets</span>
-                  <span className="num ml-auto text-[11px] text-slate-200">{compact(c.alerts)}</span>
-                </div>
-                <ul className="mt-1 space-y-0.5">
-                  {c.members.slice(0, 3).map((m) => (
-                    <li key={m.id} className="flex items-center gap-2">
-                      <span className="inline-block h-2 w-2 shrink-0" style={{ background: rampStep(m.intensity) }} />
-                      <button
-                        onClick={() => navigate(`/wallet/${m.id}`)}
-                        className="font-mono text-[10px] text-sentinel-accent hover:underline"
-                      >
-                        {shortAddress(m.id)}
-                      </button>
-                      <span className="num ml-auto text-[10px] text-slate-500">{m.alerts}</span>
-                    </li>
-                  ))}
-                  {c.size > 3 && <li className="font-mono text-[9px] text-slate-700">+{c.size - 3} more</li>}
-                </ul>
-              </li>
-            ))}
-          </ul>
-        </Panel>
+        <div className="flex flex-wrap items-center gap-3 pb-2 font-mono text-[9px] uppercase tracking-wider text-slate-700">
+          <span className="flex items-center gap-1.5">
+            <span className="inline-block h-2 w-2" style={{ background: outcomeColor('Yes') }} /> yes leg
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="inline-block h-2 w-2" style={{ background: outcomeColor('No') }} /> no leg
+          </span>
+        </div>
       </div>
     </div>
   )

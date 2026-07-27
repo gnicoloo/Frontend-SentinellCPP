@@ -9,6 +9,7 @@ import AlertExplorer from './pages/AlertExplorer'
 import WalletList from './pages/WalletList'
 import WalletDetail from './pages/WalletDetail'
 import ClusterGraph from './pages/ClusterGraph'
+import TwapScanner from './pages/TwapScanner'
 
 export default function App() {
   return (
@@ -29,6 +30,7 @@ export default function App() {
               <Route path="/wallets" element={<WalletList />} />
               <Route path="/wallet/:address" element={<WalletDetail />} />
               <Route path="/clusters" element={<ClusterGraph />} />
+              <Route path="/twap" element={<TwapScanner />} />
             </Route>
           </Route>
         </Routes>

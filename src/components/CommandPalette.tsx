@@ -13,7 +13,8 @@ const COMMANDS: Command[] = [
   { code: 'DB', label: 'Dashboard', hint: 'market overview / live tape', to: '/' },
   { code: 'AL', label: 'Alert Explorer', hint: 'query + export the alert log', to: '/alerts' },
   { code: 'WL', label: 'Wallet Screener', hint: 'rank + filter the registry', to: '/wallets' },
-  { code: 'CG', label: 'Cluster Graph', hint: 'co-trading network', to: '/clusters' },
+  { code: 'CG', label: 'Cluster Book', hint: 'combined book per cluster', to: '/clusters' },
+  { code: 'TW', label: 'Execution Scanner', hint: 'twap slicing windows', to: '/twap' },
 ]
 
 const isAddress = (q: string) => /^0x[0-9a-fA-F]{6,}$/.test(q.trim())
@@ -104,7 +105,7 @@ export default function CommandPalette() {
               if (e.key === 'ArrowUp') { e.preventDefault(); setCursor((c) => Math.max(0, c - 1)) }
               if (e.key === 'Enter') { e.preventDefault(); run(results[cursor]) }
             }}
-            placeholder="DB · AL · WL · CG · 0xADDRESS · free text"
+            placeholder="DB · AL · WL · CG · TW · 0xADDRESS · free text"
             className="w-full bg-transparent font-mono text-sm text-slate-100 outline-none placeholder:text-slate-700"
           />
           <kbd className="shrink-0 border border-sentinel-border px-1 text-[9px] font-mono text-slate-600">ESC</kbd>

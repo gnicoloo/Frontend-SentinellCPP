@@ -4,10 +4,11 @@ import { supabase } from '../lib/supabaseClient'
 import { useRange } from '../context/RangeProvider'
 import { bucketize } from '../lib/range'
 import {
-  ALERT_TYPE_ORDER, alertColor, alertLabel, formatTs, shortAddress, type AlertRow,
+  ALERT_TYPE_ORDER, alertColor, alertLabel, formatTs, isCoordinated, shortAddress, twapDuration,
+  type AlertRow, type TwapPatternRow,
 } from '../lib/types'
-import { STATUS } from '../lib/theme'
-import { ago, compact } from '../lib/format'
+import { SERIES, STATUS } from '../lib/theme'
+import { ago, compact, duration } from '../lib/format'
 import FilterBar from '../components/FilterBar'
 import Panel from '../components/viz/Panel'
 import ActivityChart from '../components/viz/ActivityChart'
@@ -301,9 +302,90 @@ export default function AlertExplorer() {
   )
 }
 
+/**
+ * The typed TWAP mirror, for alerts that have one. `twap_patterns` carries the
+ * execution detail the unified feed flattens into an opaque payload: cadence,
+ * slice count, duration and the wallets seen inside the window.
+ */
+function TwapDetail({ pattern }: { pattern: TwapPatternRow }) {
+  const windowMs = twapDuration(pattern)
+  const coord = isCoordinated(pattern)
+  const stats = [
+    { value: compact(pattern.trade_count ?? 0), label: 'slices' },
+    { value: duration((pattern.cadence_seconds ?? 0) * 1000), label: 'cadence' },
+    { value: duration(windowMs), label: 'duration' },
+    { value: compact(pattern.total_volume ?? 0), label: 'shares total' },
+    { value: compact(pattern.avg_size ?? 0), label: 'avg slice' },
+    { value: String(pattern.wallets?.length ?? 0), label: 'wallets seen' },
+  ]
+
+  return (
+    <section className="border-b border-sentinel-border">
+      <header className="flex items-center gap-2 px-3 pt-2">
+        <h4 className="font-mono text-[10px] font-bold uppercase tracking-widest text-slate-300">Execution window</h4>
+        <span
+          className="border px-1.5 py-0.5 font-mono text-[9px] uppercase"
+          style={{ borderColor: coord ? SERIES[1] : SERIES[0], color: coord ? SERIES[1] : SERIES[0] }}
+        >
+          {coord ? '▲ multi-wallet' : '● single wallet'}
+        </span>
+        <Link to="/twap" className="ml-auto font-mono text-[9px] uppercase tracking-wider text-slate-500 hover:text-sentinel-accent">
+          scanner »
+        </Link>
+      </header>
+
+      <dl className="grid grid-cols-3 gap-x-3 gap-y-2 px-3 py-2 sm:grid-cols-6">
+        {stats.map((s) => (
+          <div key={s.label}>
+            <dd className="num text-[13px] font-semibold text-slate-100">{s.value}</dd>
+            <dt className="font-mono text-[9px] uppercase tracking-wider text-slate-500">{s.label}</dt>
+          </div>
+        ))}
+      </dl>
+
+      {pattern.start_time && pattern.end_time && (
+        <p className="px-3 pb-2 font-mono text-[9px] uppercase text-slate-600">
+          {new Date(pattern.start_time).toLocaleString('it-IT')} → {new Date(pattern.end_time).toLocaleString('it-IT')}
+        </p>
+      )}
+
+      {(pattern.wallets?.length ?? 0) > 0 && (
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 px-3 pb-2">
+          <span className="font-mono text-[9px] uppercase tracking-wider text-slate-500">participants:</span>
+          {pattern.wallets!.slice(0, 10).map((w) => (
+            <Link key={w} to={`/wallet/${w}`} className="font-mono text-[10px] text-sentinel-accent hover:underline">
+              {shortAddress(w)}
+            </Link>
+          ))}
+          {pattern.wallets!.length > 10 && (
+            <span className="font-mono text-[9px] text-slate-700">+{pattern.wallets!.length - 10} more</span>
+          )}
+        </div>
+      )}
+    </section>
+  )
+}
+
 /** Renders the payload as labelled fields; raw JSON stays one keystroke away. */
 function Inspector({ alert, onClose }: { alert: AlertRow; onClose: () => void }) {
   const [raw, setRaw] = useState(false)
+  const [pattern, setPattern] = useState<TwapPatternRow | null>(null)
+
+  // The typed mirror is keyed by the same source rowid as the unified feed.
+  useEffect(() => {
+    setPattern(null)
+    if (alert.source_table !== 'twap_alerts') return
+    let cancelled = false
+    void supabase
+      .from('twap_patterns')
+      .select('*')
+      .eq('source_rowid', alert.source_rowid)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (!cancelled) setPattern((data as TwapPatternRow) ?? null)
+      })
+    return () => { cancelled = true }
+  }, [alert.source_table, alert.source_rowid])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
@@ -364,6 +446,8 @@ function Inspector({ alert, onClose }: { alert: AlertRow; onClose: () => void })
             </a>
           )}
         </div>
+
+        {pattern && <TwapDetail pattern={pattern} />}
 
         <div className="min-h-0 flex-1 overflow-auto">
           {raw ? (

@@ -3,16 +3,21 @@ import { Link } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
 import { useRange } from '../context/RangeProvider'
 import { bucketize } from '../lib/range'
-import { ALERT_TYPE_ORDER, alertColor, alertLabel, shortAddress, type AlertRow, type WalletRow } from '../lib/types'
+import {
+  ALERT_TYPE_ORDER, alertColor, alertLabel, outcomeColor, shortAddress,
+  type AlertRow, type PositionRow, type WalletRow,
+} from '../lib/types'
 import { ACCENT, SERIES, STATUS } from '../lib/theme'
 import { ago, changeRatio, compact, percentileOf, usd } from '../lib/format'
 import FilterBar from '../components/FilterBar'
+import SyncStatus from '../components/SyncStatus'
 import Panel from '../components/viz/Panel'
 import StatTile from '../components/viz/StatTile'
 import ActivityChart from '../components/viz/ActivityChart'
 import Legend from '../components/viz/Legend'
 import Sparkline from '../components/viz/Sparkline'
 import MiniBar from '../components/viz/MiniBar'
+import Signed from '../components/viz/Signed'
 
 const ROW_CAP = 6000
 
@@ -25,6 +30,7 @@ export default function Dashboard() {
   const [rows, setRows] = useState<FlowRow[]>([])
   const [wallets, setWallets] = useState<WalletRow[]>([])
   const [tape, setTape] = useState<AlertRow[]>([])
+  const [positions, setPositions] = useState<PositionRow[]>([])
   const [loading, setLoading] = useState(true)
   const [truncated, setTruncated] = useState(false)
   const [hidden, setHidden] = useState<Set<string>>(new Set())
@@ -36,7 +42,7 @@ export default function Dashboard() {
       setLoading(true)
       // One pull covering the current window AND the prior one of equal length,
       // so every delta on this page is computed off the same rows as the chart.
-      const [flowRes, walletRes, tapeRes] = await Promise.all([
+      const [flowRes, walletRes, tapeRes, posRes] = await Promise.all([
         supabase
           .from('alerts')
           .select('alert_type, wallet_address, asset_id, market_title, timestamp_ms')
@@ -46,6 +52,9 @@ export default function Dashboard() {
           .limit(ROW_CAP),
         supabase.from('wallets').select('*').order('info_score', { ascending: false }).limit(500),
         supabase.from('alerts').select('*').order('id', { ascending: false }).limit(20),
+        // The book is a live snapshot, so it is deliberately not time-scoped:
+        // "capital at risk right now" has no 24h version.
+        supabase.from('positions').select('*').order('notional_usd', { ascending: false }).limit(1000),
       ])
       if (cancelled) return
       const flow = (flowRes.data as FlowRow[]) ?? []
@@ -53,6 +62,7 @@ export default function Dashboard() {
       setTruncated(flow.length >= ROW_CAP)
       setWallets((walletRes.data as WalletRow[]) ?? [])
       setTape((tapeRes.data as AlertRow[]) ?? [])
+      setPositions((posRes.data as PositionRow[]) ?? [])
       setLoading(false)
     }
     void load()
@@ -166,6 +176,40 @@ export default function Dashboard() {
     })
   }, [current, wallets, def, start, end])
 
+  // Capital at risk, by market. Alert flow says where the noise is; this says
+  // where the money is -- the two do not always point at the same book.
+  const exposure = useMemo(() => {
+    const byMarket = new Map<string, {
+      name: string; notional: number; unrealized: number
+      wallets: Set<string>; outcomes: Map<string, number>
+    }>()
+    for (const p of positions) {
+      const name = p.market_title ?? p.asset_id
+      if (!byMarket.has(name)) {
+        byMarket.set(name, { name, notional: 0, unrealized: 0, wallets: new Set(), outcomes: new Map() })
+      }
+      const m = byMarket.get(name)!
+      m.notional += p.notional_usd
+      m.unrealized += p.unrealized_pnl
+      m.wallets.add(p.wallet_address)
+      if (p.outcome) m.outcomes.set(p.outcome, (m.outcomes.get(p.outcome) ?? 0) + p.notional_usd)
+    }
+    const top = [...byMarket.values()].sort((a, b) => b.notional - a.notional).slice(0, 8)
+    const max = top[0]?.notional ?? 1
+    return {
+      top: top.map((m) => ({
+        ...m,
+        share: m.notional / max,
+        wallets: m.wallets.size,
+        dominant: [...m.outcomes.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null,
+      })),
+      totalNotional: positions.reduce((s, p) => s + p.notional_usd, 0),
+      totalUnrealized: positions.reduce((s, p) => s + p.unrealized_pnl, 0),
+      openLegs: positions.filter((p) => p.net_contracts !== 0).length,
+      wallets: new Set(positions.map((p) => p.wallet_address)).size,
+    }
+  }, [positions])
+
   const legendItems = ALERT_TYPE_ORDER.map((t) => ({ key: t, label: alertLabel(t), color: alertColor(t) }))
   const toggle = (k: string) =>
     setHidden((prev) => {
@@ -179,12 +223,7 @@ export default function Dashboard() {
     <div>
       <FilterBar
         title="MARKET SURVEILLANCE"
-        right={
-          <span className="flex items-center gap-1.5 text-[10px] font-mono uppercase tracking-wider text-slate-500">
-            <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full" style={{ background: STATUS.good }} />
-            live
-          </span>
-        }
+        right={<SyncStatus />}
       />
 
       <div className="space-y-3">
@@ -218,6 +257,27 @@ export default function Dashboard() {
           <StatTile
             label="Peak intensity" accent={SERIES[5]} value={compact(kpis.peak)}
             footnote={`max alerts / ${def.label === '30D' ? 'day' : 'bucket'}`}
+          />
+        </div>
+
+        {/* Exposure is a live snapshot, so it carries no period delta -- these
+            tiles deliberately show no "vs prior" the way the flow tiles do. */}
+        <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
+          <StatTile
+            label="Capital at risk" accent={SERIES[4]} value={usd(exposure.totalNotional)}
+            footnote={`${compact(exposure.openLegs)} open legs · live`}
+          />
+          <StatTile
+            label="Unrealized P&L" accent={SERIES[1]} value={usd(exposure.totalUnrealized)}
+            footnote={exposure.totalUnrealized >= 0 ? '▲ book in profit' : '▼ book in loss'}
+          />
+          <StatTile
+            label="Wallets with a book" accent={SERIES[2]} value={compact(exposure.wallets)}
+            footnote="holding open exposure"
+          />
+          <StatTile
+            label="Books at risk" accent={SERIES[3]} value={compact(exposure.top.length ? new Set(positions.map((p) => p.condition_id ?? p.asset_id)).size : 0)}
+            footnote="distinct outcome tokens"
           />
         </div>
 
@@ -295,6 +355,52 @@ export default function Dashboard() {
 
         <div className="grid gap-3 xl:grid-cols-3">
           <Panel
+            title="Capital at risk"
+            meta={`top ${exposure.top.length} books · live`}
+            loading={loading}
+            table={{
+              columns: ['Market', 'Notional', 'Unrealized', 'Wallets', 'Dominant side'],
+              rows: exposure.top.map((m) => [
+                m.name, m.notional.toFixed(2), m.unrealized.toFixed(2), m.wallets, m.dominant ?? '—',
+              ]),
+            }}
+          >
+            <ul className="divide-y divide-sentinel-border/40">
+              {exposure.top.length === 0 && (
+                <li className="px-3 py-4 font-mono text-[10px] uppercase text-slate-600">
+                  no exposure synced
+                </li>
+              )}
+              {exposure.top.map((m) => (
+                <li key={m.name} className="px-3 py-1.5">
+                  <div className="flex items-baseline gap-2">
+                    <span
+                      className="inline-block h-2 w-2 shrink-0 self-center"
+                      style={{ background: outcomeColor(m.dominant) }}
+                      title={m.dominant ?? 'unknown side'}
+                    />
+                    <Link
+                      to={`/alerts?market=${encodeURIComponent(m.name)}`}
+                      className="min-w-0 flex-1 truncate text-[11px] text-slate-200 hover:text-sentinel-accent hover:underline"
+                      title={m.name}
+                    >
+                      {m.name}
+                    </Link>
+                    <span className="num shrink-0 text-[11px] font-semibold text-slate-100">{usd(m.notional)}</span>
+                  </div>
+                  <div className="mt-1 flex items-center gap-2 pl-4">
+                    <MiniBar value={m.share} color={outcomeColor(m.dominant)} width={72} />
+                    <Signed className="num text-[10px]" value={m.unrealized} format={usd} />
+                    <span className="ml-auto font-mono text-[9px] uppercase text-slate-600">
+                      {m.wallets} wlt · {m.dominant ?? 'n/a'}
+                    </span>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </Panel>
+
+          <Panel
             className="xl:col-span-2"
             title="Top actors"
             meta={`ranked by flow in ${def.label}`}
@@ -358,7 +464,9 @@ export default function Dashboard() {
               </table>
             </div>
           </Panel>
+        </div>
 
+        <div className="grid gap-3">
           <Panel title="Live tape" meta="unfiltered · newest first" actions={
             <Link to="/alerts" className="text-[9px] font-mono uppercase tracking-wider text-slate-500 hover:text-sentinel-accent">
               explorer »

@@ -1,13 +1,14 @@
 import { NavLink, Outlet } from 'react-router-dom'
 import { useAuth } from '../context/AuthProvider'
 import CommandPalette from './CommandPalette'
-import { STATUS } from '../lib/theme'
+import SyncStatus from './SyncStatus'
 
 const NAV = [
   { to: '/', label: 'Dashboard', code: 'DB', end: true },
   { to: '/alerts', label: 'Alerts', code: 'AL' },
   { to: '/wallets', label: 'Wallets', code: 'WL' },
   { to: '/clusters', label: 'Clusters', code: 'CG' },
+  { to: '/twap', label: 'Execution', code: 'TW' },
 ]
 
 export default function Layout() {
@@ -46,10 +47,7 @@ export default function Layout() {
         </nav>
 
         <div className="border-t border-sentinel-border p-3 font-mono text-xs text-slate-500">
-          <p className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider">
-            <span className="inline-block h-1.5 w-1.5 rounded-full" style={{ background: STATUS.good }} />
-            feed connected
-          </p>
+          <SyncStatus />
           <p className="mt-1 truncate text-[10px]">{session?.user.email}</p>
           <button
             onClick={() => void signOut()}

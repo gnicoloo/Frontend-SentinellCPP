@@ -45,6 +45,18 @@ export function ymd(ms: number | null | undefined): string {
   return new Date(ms).toISOString().slice(0, 10)
 }
 
+/**
+ * A span, not a clock time: "45s" / "12m" / "3.2h". Cadence and window length
+ * range over three orders of magnitude, so the unit floats with the value.
+ */
+export function duration(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined || Number.isNaN(ms)) return '—'
+  const s = ms / 1000
+  if (s < 90) return `${s.toFixed(s < 10 ? 1 : 0)}s`
+  if (s < 5400) return `${(s / 60).toFixed(s < 600 ? 1 : 0)}m`
+  return `${(s / 3600).toFixed(1)}h`
+}
+
 /** "3m" / "4h" / "6d" -- terminal-tape age, right-aligned in feeds. */
 export function ago(ms: number | null | undefined): string {
   if (!ms) return '—'

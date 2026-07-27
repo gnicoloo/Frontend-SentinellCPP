@@ -7,8 +7,8 @@ import { supabase } from '../lib/supabaseClient'
 import { useRange } from '../context/RangeProvider'
 import { bucketize } from '../lib/range'
 import {
-  ALERT_TYPE_ORDER, alertColor, alertLabel, formatTs, shortAddress,
-  type AlertRow, type WalletRow,
+  ALERT_TYPE_ORDER, alertColor, alertLabel, formatTs, isCoordinated, shortAddress, twapDuration,
+  type AlertRow, type PositionRow, type TwapPatternRow, type WalletRow,
 } from '../lib/types'
 import { INK, SERIES, STATUS, severityOf } from '../lib/theme'
 import { ago, compact, ordinal, percentileOf, pct, usd } from '../lib/format'
@@ -20,6 +20,8 @@ import ScoreMeter from '../components/viz/ScoreMeter'
 import ActivityChart from '../components/viz/ActivityChart'
 import Legend from '../components/viz/Legend'
 import MiniBar from '../components/viz/MiniBar'
+import ExposureTable, { type ExposureRow } from '../components/viz/ExposureTable'
+import Signed from '../components/viz/Signed'
 
 const SUB_SCORES = [
   { key: 'winrate_score', label: 'WINRATE' },
@@ -54,12 +56,18 @@ interface DeceptionRow {
 
 export default function WalletDetail() {
   const { address = '' } = useParams()
+  // Every address is stored lowercase (EIP-55 is only a display checksum), so
+  // a hand-typed or checksummed URL must be normalized before it is queried --
+  // otherwise the page renders "not found" for a wallet that exists.
+  const addr = useMemo(() => address.trim().toLowerCase(), [address])
   const { def, key: rangeKey, nonce, start, end } = useRange()
 
   const [wallet, setWallet] = useState<WalletRow | null>(null)
   const [peers, setPeers] = useState<WalletRow[]>([])
   const [alerts, setAlerts] = useState<AlertRow[]>([])
   const [moves, setMoves] = useState<SuspectMove[]>([])
+  const [positions, setPositions] = useState<PositionRow[]>([])
+  const [twaps, setTwaps] = useState<TwapPatternRow[]>([])
   const [deception, setDeception] = useState<DeceptionRow | null>(null)
   const [loading, setLoading] = useState(true)
   const [notFound, setNotFound] = useState(false)
@@ -70,17 +78,32 @@ export default function WalletDetail() {
     let cancelled = false
     const load = async () => {
       setLoading(true)
-      const [walletRes, peerRes, alertRes, moveRes, decRes] = await Promise.all([
-        supabase.from('wallets').select('*').eq('address', address).maybeSingle(),
+      const [walletRes, peerRes, alertRes, moveRes, decRes, posRes, twapRes] = await Promise.all([
+        supabase.from('wallets').select('*').eq('address', addr).maybeSingle(),
         supabase.from('wallets').select('*').order('info_score', { ascending: false }).limit(500),
-        supabase.from('alerts').select('*').eq('wallet_address', address).order('timestamp_ms', { ascending: false }).limit(500),
-        supabase.from('suspect_moves').select('*').eq('wallet_address', address).order('timestamp_ms', { ascending: false }).limit(100),
+        supabase.from('alerts').select('*').eq('wallet_address', addr).order('timestamp_ms', { ascending: false }).limit(500),
+        supabase.from('suspect_moves').select('*').eq('wallet_address', addr).order('timestamp_ms', { ascending: false }).limit(100),
         supabase
           .from('deception_alerts')
           .select('deception_score, roi_discrepancy_score, loss_cluster_score, asymmetry_score')
-          .eq('wallet_address', address)
+          .eq('wallet_address', addr)
           .order('id', { ascending: false })
           .limit(1),
+        supabase
+          .from('positions')
+          .select('*')
+          .eq('wallet_address', addr)
+          .order('notional_usd', { ascending: false })
+          .limit(200),
+        // jsonb containment. The value MUST be pre-stringified JSON: handed a
+        // JS array, postgrest-js emits a Postgres array literal (cs.{0x..}),
+        // which never matches a jsonb column.
+        supabase
+          .from('twap_patterns')
+          .select('*')
+          .contains('wallets', JSON.stringify([addr]))
+          .order('end_time', { ascending: false })
+          .limit(50),
       ])
       if (cancelled) return
       setWallet((walletRes.data as WalletRow) ?? null)
@@ -88,13 +111,15 @@ export default function WalletDetail() {
       setPeers((peerRes.data as WalletRow[]) ?? [])
       setAlerts((alertRes.data as AlertRow[]) ?? [])
       setMoves((moveRes.data as SuspectMove[]) ?? [])
+      setPositions((posRes.data as PositionRow[]) ?? [])
+      setTwaps((twapRes.data as TwapPatternRow[]) ?? [])
       const d = decRes.data as DeceptionRow[] | null
       setDeception(d && d.length > 0 ? d[0] : null)
       setLoading(false)
     }
     void load()
     return () => { cancelled = true }
-  }, [address, rangeKey, nonce])
+  }, [addr, rangeKey, nonce])
 
   const windowAlerts = useMemo(
     () => alerts.filter((a) => a.timestamp_ms !== null && a.timestamp_ms >= start && a.timestamp_ms <= end),
@@ -149,6 +174,33 @@ export default function WalletDetail() {
     const max = list[0]?.count ?? 1
     return list.map((m) => ({ ...m, share: m.count / max, types: [...m.types] }))
   }, [alerts])
+
+  // The live book: what this wallet actually holds right now, not what it was
+  // flagged for. `positions` carries one row per (wallet, outcome token).
+  const book = useMemo(() => {
+    const open = positions.filter((p) => p.net_contracts !== 0)
+    const rows: ExposureRow[] = open.map((p) => ({
+      id: p.asset_id,
+      market: p.market_title ?? p.asset_id,
+      outcome: p.outcome,
+      netContracts: p.net_contracts,
+      notional: p.notional_usd,
+      avgEntry: p.avg_entry_price,
+      last: p.last_price,
+      unrealized: p.unrealized_pnl,
+      href: p.market_title ? `/alerts?market=${encodeURIComponent(p.market_title)}` : undefined,
+    }))
+    const sum = (pick: (p: PositionRow) => number) => positions.reduce((s, p) => s + pick(p), 0)
+    return {
+      rows,
+      openCount: open.length,
+      notional: sum((p) => p.notional_usd),
+      unrealized: sum((p) => p.unrealized_pnl),
+      realized: sum((p) => p.realized_pnl),
+      markets: new Set(positions.map((p) => p.condition_id ?? p.asset_id)).size,
+      lastTrade: Math.max(0, ...positions.map((p) => p.last_trade_ms ?? 0)) || null,
+    }
+  }, [positions])
 
   const legendItems = ALERT_TYPE_ORDER.map((t) => ({ key: t, label: alertLabel(t), color: alertColor(t) }))
   const toggle = (k: string) =>
@@ -247,6 +299,75 @@ export default function WalletDetail() {
             />
           </div>
         )}
+
+        {/* The live book sits above the alert history: what the wallet holds
+            now is the first question, what it was flagged for is the second. */}
+        <div className="grid gap-3 xl:grid-cols-3">
+          <Panel
+            className="xl:col-span-2"
+            title="Position book"
+            meta={
+              positions.length === 0
+                ? 'no exposure synced'
+                : `${book.openCount} open · ${book.markets} tokens · ${usd(book.notional)} at risk`
+            }
+            loading={loading}
+            actions={
+              book.lastTrade ? (
+                <span className="font-mono text-[9px] uppercase tracking-wider text-slate-600">
+                  last fill {ago(book.lastTrade)} ago
+                </span>
+              ) : undefined
+            }
+            table={{
+              columns: ['Market', 'Outcome', 'Net', 'Notional', 'Entry', 'Mark', 'Unrealized', 'Realized'],
+              rows: positions.map((p) => [
+                p.market_title ?? p.asset_id,
+                p.outcome ?? '—',
+                p.net_contracts.toFixed(2),
+                p.notional_usd.toFixed(2),
+                p.avg_entry_price.toFixed(4),
+                p.last_price.toFixed(4),
+                p.unrealized_pnl.toFixed(2),
+                p.realized_pnl.toFixed(2),
+              ]),
+            }}
+          >
+            <ExposureTable
+              rows={book.rows}
+              emptyLabel={positions.length === 0 ? 'no exposure synced for this wallet' : 'all positions closed'}
+              maxHeight={260}
+            />
+          </Panel>
+
+          <Panel title="Exposure summary" meta="live book" loading={loading}>
+            <dl className="divide-y divide-sentinel-border/40">
+              {[
+                { label: 'Capital at risk', node: <span className="num text-slate-100">{usd(book.notional)}</span> },
+                { label: 'Unrealized P&L', node: <Signed className="num" value={book.unrealized} format={usd} /> },
+                { label: 'Realized P&L', node: <Signed className="num" value={book.realized} format={usd} /> },
+                {
+                  label: 'Open / total legs',
+                  node: <span className="num text-slate-300">{book.openCount} / {positions.length}</span>,
+                },
+                {
+                  label: 'Distinct markets',
+                  node: <span className="num text-slate-300">{compact(book.markets)}</span>,
+                },
+              ].map((r) => (
+                <div key={r.label} className="flex items-baseline justify-between gap-3 px-3 py-2">
+                  <dt className="font-mono text-[10px] uppercase tracking-wider text-slate-500">{r.label}</dt>
+                  <dd className="text-[12px] font-semibold">{r.node}</dd>
+                </div>
+              ))}
+            </dl>
+            {positions.length === 0 && (
+              <p className="px-3 py-2 font-mono text-[9px] uppercase leading-relaxed text-slate-700">
+                positions table empty — run a sync pass with the sentinel metrics endpoint reachable
+              </p>
+            )}
+          </Panel>
+        </div>
 
         <div className="grid gap-3 xl:grid-cols-3">
           <Panel
@@ -439,6 +560,77 @@ export default function WalletDetail() {
             </div>
           </Panel>
         </div>
+
+        <Panel
+          title="TWAP participation"
+          meta={
+            twaps.length === 0
+              ? 'no sliced execution windows'
+              : `${twaps.length} windows · ${twaps.filter(isCoordinated).length} multi-wallet`
+          }
+          loading={loading}
+          actions={
+            <Link to="/twap" className="font-mono text-[9px] uppercase tracking-wider text-slate-500 hover:text-sentinel-accent">
+              scanner »
+            </Link>
+          }
+          table={{
+            columns: ['Market', 'Slices', 'Cadence (s)', 'Duration (s)', 'Shares', 'Co-participants'],
+            rows: twaps.map((p) => [
+              p.market_slug || p.condition_id,
+              p.trade_count ?? 0,
+              (p.cadence_seconds ?? 0).toFixed(1),
+              ((twapDuration(p) ?? 0) / 1000).toFixed(0),
+              (p.total_volume ?? 0).toFixed(2),
+              Math.max(0, (p.wallets?.length ?? 1) - 1),
+            ]),
+          }}
+        >
+          <ul className="max-h-64 divide-y divide-sentinel-border/40 overflow-y-auto">
+            {twaps.length === 0 && (
+              <li className="px-3 py-4 font-mono text-[10px] uppercase text-slate-600">
+                this wallet appears in no detected slicing window
+              </li>
+            )}
+            {twaps.map((p) => {
+              const coord = isCoordinated(p)
+              const others = (p.wallets ?? []).filter((w) => w !== addr)
+              return (
+                <li key={p.id} className="px-3 py-1.5">
+                  <div className="flex items-baseline gap-2">
+                    <span
+                      className="inline-block h-2 w-2 shrink-0 self-center"
+                      style={{ background: coord ? SERIES[1] : SERIES[0] }}
+                      title={coord ? 'multi-wallet window' : 'single wallet window'}
+                    />
+                    <span className="min-w-0 flex-1 truncate text-[11px] text-slate-200" title={p.market_slug || p.condition_id}>
+                      {p.market_slug || p.condition_id}
+                    </span>
+                    <span className="num shrink-0 font-mono text-[10px] text-slate-500">
+                      {p.end_time ? `${ago(p.end_time)} ago` : '—'}
+                    </span>
+                  </div>
+                  <div className="mt-0.5 flex flex-wrap items-center gap-x-3 pl-4 font-mono text-[9px] uppercase text-slate-600">
+                    <span>{compact(p.trade_count ?? 0)} slices</span>
+                    <span>{(p.cadence_seconds ?? 0).toFixed(1)}s cadence</span>
+                    <span>{compact(p.total_volume ?? 0)} shares</span>
+                    {others.length > 0 && (
+                      <span className="flex flex-wrap items-center gap-x-1.5">
+                        with:
+                        {others.slice(0, 4).map((w) => (
+                          <Link key={w} to={`/wallet/${w}`} className="text-sentinel-accent hover:underline">
+                            {shortAddress(w)}
+                          </Link>
+                        ))}
+                        {others.length > 4 && <span className="text-slate-700">+{others.length - 4}</span>}
+                      </span>
+                    )}
+                  </div>
+                </li>
+              )
+            })}
+          </ul>
+        </Panel>
 
         <Panel
           title="Alert log"

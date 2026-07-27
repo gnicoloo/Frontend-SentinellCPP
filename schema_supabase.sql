@@ -131,6 +131,57 @@ create table if not exists public.suspect_moves (
 create index if not exists idx_suspect_wallet on public.suspect_moves (wallet_address);
 
 -- ---------------------------------------------------------------------------
+-- positions: live exposure book, one row per (wallet, outcome token) -- WHICH
+-- contract, on WHICH option, how many and for how much. Fed from
+-- GET /positions (see src/ExposureTracker.h), upserted on every sync pass.
+-- ---------------------------------------------------------------------------
+create table if not exists public.positions (
+    wallet_address text not null,
+    asset_id text not null,           -- ERC1155 outcome token
+    condition_id text,                -- market condition
+    market_title text,
+    outcome text,                     -- 'Yes' / 'No' -- l'opzione
+    net_contracts double precision default 0,   -- + long, - short
+    avg_entry_price double precision default 0,
+    notional_usd double precision default 0,    -- |net| * avg_entry_price
+    total_bought double precision default 0,
+    total_sold double precision default 0,
+    realized_pnl double precision default 0,
+    unrealized_pnl double precision default 0,
+    last_price double precision default 0,
+    trade_count bigint default 0,
+    first_trade_ms bigint,
+    last_trade_ms bigint,
+    updated_at timestamptz not null default now(),
+    primary key (wallet_address, asset_id),
+    constraint fk_positions_wallet foreign key (wallet_address)
+        references public.wallets(address) on delete cascade on update cascade
+);
+create index if not exists idx_positions_wallet on public.positions (wallet_address);
+create index if not exists idx_positions_notional on public.positions (notional_usd desc);
+create index if not exists idx_positions_condition on public.positions (condition_id);
+
+-- ---------------------------------------------------------------------------
+-- clusters: one row per correlation cluster with its COMBINED book -- the
+-- aggregate (wallets, total contracts, total capital, per-outcome legs), not
+-- the single operation. Fed from GET /clusters.
+-- ---------------------------------------------------------------------------
+create table if not exists public.clusters (
+    cluster_key text primary key,     -- lowest member address (stable id)
+    wallets jsonb not null,           -- member addresses
+    wallet_count integer default 0,
+    wallets_with_positions integer default 0,
+    total_notional_usd double precision default 0,
+    gross_contracts double precision default 0,
+    realized_pnl double precision default 0,
+    unrealized_pnl double precision default 0,
+    market_count integer default 0,
+    legs jsonb,                       -- per-outcome breakdown, biggest first
+    updated_at timestamptz not null default now()
+);
+create index if not exists idx_clusters_notional on public.clusters (total_notional_usd desc);
+
+-- ---------------------------------------------------------------------------
 -- last_sync: sync bookmark per source table (written by the sync script).
 -- ---------------------------------------------------------------------------
 create table if not exists public.last_sync (
@@ -148,6 +199,8 @@ alter table public.alerts enable row level security;
 alter table public.twap_patterns enable row level security;
 alter table public.deception_alerts enable row level security;
 alter table public.suspect_moves enable row level security;
+alter table public.positions enable row level security;
+alter table public.clusters enable row level security;
 alter table public.last_sync enable row level security;
 
 drop policy if exists "read wallets" on public.wallets;
@@ -160,6 +213,71 @@ drop policy if exists "read deception" on public.deception_alerts;
 create policy "read deception" on public.deception_alerts for select to authenticated using (true);
 drop policy if exists "read suspects" on public.suspect_moves;
 create policy "read suspects" on public.suspect_moves for select to authenticated using (true);
+drop policy if exists "read positions" on public.positions;
+create policy "read positions" on public.positions for select to authenticated using (true);
+drop policy if exists "read clusters" on public.clusters;
+create policy "read clusters" on public.clusters for select to authenticated using (true);
 
--- Realtime: the frontend subscribes to INSERTs on alerts.
-alter publication supabase_realtime add table public.alerts;
+-- ---------------------------------------------------------------------------
+-- Migration for databases created by an EARLIER version of this file.
+-- `create table if not exists` skips existing tables wholesale -- constraints
+-- included -- so the FKs and the CHECK above never reach a database that
+-- already had the tables. These blocks add them only when missing, and are
+-- no-ops on a fresh install.
+--
+-- If one of them fails with "violates foreign key constraint", the offending
+-- table holds alerts for wallets that are not in `wallets`: run one sync pass
+-- with the current scripts/sync_to_supabase.py (it upserts wallet stubs
+-- first) and re-run this file.
+-- ---------------------------------------------------------------------------
+do $$
+begin
+    if not exists (select 1 from pg_constraint where conname = 'fk_alerts_wallet') then
+        alter table public.alerts add constraint fk_alerts_wallet
+            foreign key (wallet_address) references public.wallets(address)
+            on delete set null on update cascade;
+    end if;
+
+    if not exists (select 1 from pg_constraint where conname = 'chk_alerts_type') then
+        alter table public.alerts add constraint chk_alerts_type check (
+            alert_type in ('oracle_move', 'suspect_trade', 'twap_pattern',
+                           'deception_alert', 'cluster_move', 'trade_anomaly',
+                           'wallet_alert', 'hot_wallet', 'forensic_alert', 'intelligence_alert')
+        );
+    end if;
+
+    if not exists (select 1 from pg_constraint where conname = 'fk_deception_wallet') then
+        alter table public.deception_alerts add constraint fk_deception_wallet
+            foreign key (wallet_address) references public.wallets(address)
+            on delete cascade on update cascade;
+    end if;
+
+    if not exists (select 1 from pg_constraint where conname = 'fk_suspect_wallet') then
+        alter table public.suspect_moves add constraint fk_suspect_wallet
+            foreign key (wallet_address) references public.wallets(address)
+            on delete cascade on update cascade;
+    end if;
+
+    if not exists (select 1 from pg_constraint where conname = 'fk_positions_wallet') then
+        alter table public.positions add constraint fk_positions_wallet
+            foreign key (wallet_address) references public.wallets(address)
+            on delete cascade on update cascade;
+    end if;
+end $$;
+
+-- ---------------------------------------------------------------------------
+-- Realtime: the frontend subscribes to INSERTs on alerts. ALTER PUBLICATION
+-- has no IF NOT EXISTS form, so re-running this file would fail with
+-- "relation is already member of publication" -- hence the guard.
+-- ---------------------------------------------------------------------------
+do $$
+begin
+    if not exists (
+        select 1 from pg_publication_tables
+        where pubname = 'supabase_realtime'
+          and schemaname = 'public'
+          and tablename = 'alerts'
+    ) then
+        alter publication supabase_realtime add table public.alerts;
+    end if;
+end $$;
