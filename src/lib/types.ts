@@ -13,6 +13,20 @@ export interface AlertRow {
   created_at: string
 }
 
+export interface AlertTradeRow {
+  id: number
+  source_rowid: number
+  wallet_address: string
+  asset_id: string
+  market_title: string | null
+  price: number
+  size: number
+  side: string
+  estimated_pnl: number | null
+  timestamp_ms: number
+  created_at: string
+}
+
 export interface WalletRow {
   address: string
   label: string | null
@@ -161,7 +175,11 @@ export const ALERT_TYPE_LABELS: Record<string, string> = {
   twap_pattern: 'TWAP Pattern',
   deception_alert: 'Deception',
   cluster_move: 'Cluster Move',
+  trade_anomaly: 'Trade Anomaly',
   wallet_alert: 'Wallet/Hot',
+  hot_wallet: 'Hot Wallet',
+  forensic_alert: 'Forensic Alert',
+  intelligence_alert: 'Intel Alert',
 }
 
 /**
@@ -175,7 +193,11 @@ export const ALERT_TYPE_ORDER = [
   'twap_pattern',
   'deception_alert',
   'cluster_move',
+  'trade_anomaly',
   'wallet_alert',
+  'hot_wallet',
+  'forensic_alert',
+  'intelligence_alert',
 ] as const
 
 export const ALERT_TYPE_COLORS: Record<string, string> = Object.fromEntries(

@@ -5,7 +5,7 @@ import { useRange } from '../context/RangeProvider'
 import { bucketize } from '../lib/range'
 import {
   ALERT_TYPE_ORDER, alertColor, alertLabel, outcomeColor, shortAddress,
-  type AlertRow, type PositionRow, type WalletRow,
+  type AlertRow, type AlertTradeRow, type PositionRow, type WalletRow,
 } from '../lib/types'
 import { ACCENT, SERIES, STATUS } from '../lib/theme'
 import { ago, changeRatio, compact, percentileOf, usd } from '../lib/format'
@@ -29,7 +29,7 @@ export default function Dashboard() {
   const { def, key, nonce, start, end, prevStart } = useRange()
   const [rows, setRows] = useState<FlowRow[]>([])
   const [wallets, setWallets] = useState<WalletRow[]>([])
-  const [tape, setTape] = useState<AlertRow[]>([])
+  const [tape, setTape] = useState<AlertTradeRow[]>([])
   const [positions, setPositions] = useState<PositionRow[]>([])
   const [loading, setLoading] = useState(true)
   const [truncated, setTruncated] = useState(false)
@@ -51,7 +51,7 @@ export default function Dashboard() {
           .order('timestamp_ms', { ascending: false })
           .limit(ROW_CAP),
         supabase.from('wallets').select('*').order('info_score', { ascending: false }).limit(500),
-        supabase.from('alerts').select('*').order('id', { ascending: false }).limit(20),
+        supabase.from('alert_trades').select('*').order('id', { ascending: false }).limit(20),
         // The book is a live snapshot, so it is deliberately not time-scoped:
         // "capital at risk right now" has no 24h version.
         supabase.from('positions').select('*').order('notional_usd', { ascending: false }).limit(1000),
@@ -61,7 +61,7 @@ export default function Dashboard() {
       setRows(flow)
       setTruncated(flow.length >= ROW_CAP)
       setWallets((walletRes.data as WalletRow[]) ?? [])
-      setTape((tapeRes.data as AlertRow[]) ?? [])
+      setTape((tapeRes.data as AlertTradeRow[]) ?? [])
       setPositions((posRes.data as PositionRow[]) ?? [])
       setLoading(false)
     }
@@ -72,11 +72,9 @@ export default function Dashboard() {
   // Live tape: new inserts land at the top and flash once.
   useEffect(() => {
     const channel = supabase
-      .channel('alerts-feed')
+      .channel('dashboard-feed')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'alerts' }, (payload) => {
         const row = payload.new as AlertRow
-        flashRef.current.add(row.id)
-        setTape((prev) => [row, ...prev].slice(0, 20))
         setRows((prev) => [{
           alert_type: row.alert_type,
           wallet_address: row.wallet_address,
@@ -84,6 +82,11 @@ export default function Dashboard() {
           market_title: row.market_title,
           timestamp_ms: row.timestamp_ms,
         }, ...prev])
+      })
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'alert_trades' }, (payload) => {
+        const row = payload.new as AlertTradeRow
+        flashRef.current.add(row.id)
+        setTape((prev) => [row, ...prev].slice(0, 20))
       })
       .subscribe()
     return () => { void supabase.removeChannel(channel) }
@@ -474,31 +477,34 @@ export default function Dashboard() {
           }>
             <ul className="max-h-[280px] divide-y divide-sentinel-border/40 overflow-y-auto">
               {tape.length === 0 && <li className="px-3 py-4 text-[10px] font-mono text-slate-600">AWAITING EVENTS…</li>}
-              {tape.map((a) => (
-                <li
-                  key={`${a.source_table}-${a.source_rowid}`}
-                  className={`flex items-center gap-2 px-3 py-1.5 ${flashRef.current.has(a.id) ? 'tape-flash' : ''}`}
-                >
-                  <span
-                    className="w-16 shrink-0 truncate border-l-2 pl-1.5 text-[9px] font-mono uppercase text-slate-400"
-                    style={{ borderColor: alertColor(a.alert_type) }}
-                    title={alertLabel(a.alert_type)}
+              {tape.map((a) => {
+                const isBuy = a.side.toUpperCase().startsWith('B')
+                return (
+                  <li
+                    key={a.id}
+                    className={`flex items-center gap-2 px-3 py-1.5 ${flashRef.current.has(a.id) ? 'tape-flash' : ''}`}
                   >
-                    {alertLabel(a.alert_type)}
-                  </span>
-                  {a.wallet_address ? (
-                    <Link to={`/wallet/${a.wallet_address}`} className="shrink-0 font-mono text-[10px] text-sentinel-accent hover:underline">
-                      {shortAddress(a.wallet_address)}
-                    </Link>
-                  ) : (
-                    <span className="shrink-0 font-mono text-[10px] text-slate-600">—</span>
-                  )}
-                  <span className="min-w-0 flex-1 truncate text-[10px] text-slate-300" title={a.market_title ?? undefined}>
-                    {a.market_title ?? a.asset_id ?? 'unknown asset'}
-                  </span>
-                  <span className="num w-8 shrink-0 text-right text-[10px] text-slate-600">{ago(a.timestamp_ms)}</span>
-                </li>
-              ))}
+                    <span
+                      className="w-12 shrink-0 truncate border-l-2 pl-1.5 text-[9px] font-mono font-bold uppercase"
+                      style={{ borderColor: isBuy ? STATUS.good : STATUS.critical, color: isBuy ? STATUS.good : STATUS.critical }}
+                      title={a.side}
+                    >
+                      {isBuy ? 'BUY' : 'SELL'}
+                    </span>
+                    {a.wallet_address ? (
+                      <Link to={`/wallet/${a.wallet_address}`} className="shrink-0 font-mono text-[10px] text-sentinel-accent hover:underline">
+                        {shortAddress(a.wallet_address)}
+                      </Link>
+                    ) : (
+                      <span className="shrink-0 font-mono text-[10px] text-slate-600">—</span>
+                    )}
+                    <span className="num min-w-0 flex-1 truncate text-[10px] text-slate-300" title={a.market_title ?? undefined}>
+                      {compact(a.size)} <span className="text-slate-500">@</span> {a.price.toFixed(3)} <span className="text-slate-600">·</span> {a.market_title ?? a.asset_id ?? 'unknown asset'}
+                    </span>
+                    <span className="num w-8 shrink-0 text-right text-[10px] text-slate-600">{ago(a.timestamp_ms)}</span>
+                  </li>
+                )
+              })}
             </ul>
           </Panel>
         </div>
