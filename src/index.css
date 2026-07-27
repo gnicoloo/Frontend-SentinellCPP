@@ -8,3 +8,48 @@ body {
   @apply bg-sentinel-bg text-slate-200 antialiased font-sans text-sm;
 }
 
+@layer components {
+  /* Columns of numbers that must align vertically. Never on hero figures --
+     equal-width digits make a large standalone number read loose. */
+  .num {
+    font-family: theme('fontFamily.mono');
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* A new tape row announces itself once, then settles. */
+@keyframes tape-flash {
+  from { background-color: rgba(34, 197, 94, 0.18); }
+  to { background-color: transparent; }
+}
+.tape-flash {
+  animation: tape-flash 1.2s ease-out 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tape-flash,
+  .animate-pulse {
+    animation: none;
+  }
+}
+
+/* Dense terminal scrollbars -- panels scroll often and the default bar is loud. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #334155 transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #334155;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+:focus-visible {
+  outline: 1px solid #22c55e;
+  outline-offset: 1px;
+}

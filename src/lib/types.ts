@@ -1,3 +1,5 @@
+import { INK, SERIES } from './theme'
+
 export interface AlertRow {
   id: number
   source_table: string
@@ -38,13 +40,30 @@ export const ALERT_TYPE_LABELS: Record<string, string> = {
   wallet_alert: 'Wallet/Hot',
 }
 
-export const ALERT_TYPE_COLORS: Record<string, string> = {
-  oracle_move: '#a78bfa',
-  suspect_trade: '#f87171',
-  twap_pattern: '#38bdf8',
-  deception_alert: '#fbbf24',
-  cluster_move: '#34d399',
-  wallet_alert: '#fb923c',
+/**
+ * Alert type -> categorical slot, in fixed order. The mapping is bound to the
+ * entity, so filtering the feed never repaints the surviving types. Unknown
+ * types fall back to muted ink rather than borrowing a slot.
+ */
+export const ALERT_TYPE_ORDER = [
+  'oracle_move',
+  'suspect_trade',
+  'twap_pattern',
+  'deception_alert',
+  'cluster_move',
+  'wallet_alert',
+] as const
+
+export const ALERT_TYPE_COLORS: Record<string, string> = Object.fromEntries(
+  ALERT_TYPE_ORDER.map((type, i) => [type, SERIES[i]]),
+)
+
+export function alertColor(type: string): string {
+  return ALERT_TYPE_COLORS[type] ?? INK.muted
+}
+
+export function alertLabel(type: string): string {
+  return ALERT_TYPE_LABELS[type] ?? type.replaceAll('_', ' ').toUpperCase()
 }
 
 export function shortAddress(address: string | null | undefined): string {

@@ -1,5 +1,6 @@
 import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import { AuthProvider } from './context/AuthProvider'
+import { RangeProvider } from './context/RangeProvider'
 import ProtectedRoute from './components/ProtectedRoute'
 import Layout from './components/Layout'
 import Login from './pages/Login'
@@ -16,7 +17,13 @@ export default function App() {
         <Routes>
           <Route path="/login" element={<Login />} />
           <Route element={<ProtectedRoute />}>
-            <Route element={<Layout />}>
+            <Route
+              element={
+                <RangeProvider>
+                  <Layout />
+                </RangeProvider>
+              }
+            >
               <Route path="/" element={<Dashboard />} />
               <Route path="/alerts" element={<AlertExplorer />} />
               <Route path="/wallets" element={<WalletList />} />

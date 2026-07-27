@@ -1,89 +1,280 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
+import { useRange } from '../context/RangeProvider'
+import { bucketize } from '../lib/range'
 import { shortAddress, type WalletRow } from '../lib/types'
+import { SERIES, STATUS } from '../lib/theme'
+import { compact, percentileOf, pct, usd } from '../lib/format'
+import { quantile } from '../lib/stats'
+import FilterBar from '../components/FilterBar'
+import Panel from '../components/viz/Panel'
+import Histogram from '../components/viz/Histogram'
+import MiniBar from '../components/viz/MiniBar'
+import Sparkline from '../components/viz/Sparkline'
 
-type SortKey = 'info_score' | 'suspicious_score' | 'forensic_score' | 'total_volume' | 'trades_count' | 'roi_estimate'
+type SortKey =
+  | 'flow' | 'info_score' | 'suspicious_score' | 'forensic_score'
+  | 'roi_estimate' | 'win_rate' | 'trades_count' | 'total_volume' | 'total_profit'
 
-const COLUMNS: { key: SortKey; label: string }[] = [
-  { key: 'info_score', label: 'INFO' },
-  { key: 'suspicious_score', label: 'SUSP' },
-  { key: 'forensic_score', label: 'FORENSIC' },
-  { key: 'roi_estimate', label: 'ROI' },
-  { key: 'trades_count', label: 'TX' },
-  { key: 'total_volume', label: 'VOL ($)' },
+interface Column {
+  key: SortKey
+  label: string
+  /** How the cell is rendered; drives alignment and the metric formatter. */
+  format: (w: Screened) => string
+  /** Only score columns get an in-row magnitude bar. */
+  bar?: boolean
+  hideOnMobile?: boolean
+  /** Domain max for the bar; null means "scale to the visible max". */
+  max?: number
+}
+
+interface Screened extends WalletRow {
+  flow: number
+  series: number[]
+  win_rate: number
+  info_pctl: number
+}
+
+const COLUMNS: Column[] = [
+  { key: 'flow', label: 'Flow', format: (w) => compact(w.flow) },
+  { key: 'info_score', label: 'Info', format: (w) => w.info_score.toFixed(1), bar: true, max: 100 },
+  { key: 'suspicious_score', label: 'Susp', format: (w) => w.suspicious_score.toFixed(2), bar: true, max: 10 },
+  { key: 'forensic_score', label: 'Forensic', format: (w) => w.forensic_score.toFixed(2), bar: true, max: 10, hideOnMobile: true },
+  { key: 'roi_estimate', label: 'ROI', format: (w) => pct(w.roi_estimate) },
+  { key: 'win_rate', label: 'Win', format: (w) => pct(w.win_rate), hideOnMobile: true },
+  { key: 'trades_count', label: 'TX', format: (w) => compact(w.trades_count), hideOnMobile: true },
+  { key: 'total_volume', label: 'Volume', format: (w) => usd(w.total_volume) },
+  { key: 'total_profit', label: 'P&L', format: (w) => usd(w.total_profit), hideOnMobile: true },
 ]
 
+const ROW_CAP = 6000
+
 export default function WalletList() {
-  const [rows, setRows] = useState<WalletRow[]>([])
+  const { def, key: rangeKey, nonce, start, end } = useRange()
+  const [wallets, setWallets] = useState<WalletRow[]>([])
+  const [flowRows, setFlowRows] = useState<{ wallet_address: string | null; timestamp_ms: number | null }[]>([])
   const [search, setSearch] = useState('')
   const [sortKey, setSortKey] = useState<SortKey>('info_score')
-  const [loading, setLoading] = useState(false)
+  const [desc, setDesc] = useState(true)
+  const [labeledOnly, setLabeledOnly] = useState(false)
+  const [activeOnly, setActiveOnly] = useState(false)
+  const [loading, setLoading] = useState(true)
 
   useEffect(() => {
+    let cancelled = false
     const load = async () => {
       setLoading(true)
-      let query = supabase.from('wallets').select('*')
-      if (search) query = query.ilike('address', `%${search.toLowerCase()}%`)
-      const { data } = await query.order(sortKey, { ascending: false }).limit(200)
-      setRows((data as WalletRow[]) ?? [])
+      const [walletRes, flowRes] = await Promise.all([
+        supabase.from('wallets').select('*').order('info_score', { ascending: false }).limit(500),
+        supabase
+          .from('alerts')
+          .select('wallet_address, timestamp_ms')
+          .not('wallet_address', 'is', null)
+          .gte('timestamp_ms', start)
+          .lte('timestamp_ms', end)
+          .limit(ROW_CAP),
+      ])
+      if (cancelled) return
+      setWallets((walletRes.data as WalletRow[]) ?? [])
+      setFlowRows((flowRes.data as { wallet_address: string | null; timestamp_ms: number | null }[]) ?? [])
       setLoading(false)
     }
     void load()
-  }, [search, sortKey])
+    return () => { cancelled = true }
+  }, [rangeKey, nonce, start, end])
+
+  const screened = useMemo<Screened[]>(() => {
+    const byWallet = new Map<string, { wallet_address: string | null; timestamp_ms: number | null }[]>()
+    for (const r of flowRows) {
+      if (!r.wallet_address) continue
+      const list = byWallet.get(r.wallet_address)
+      if (list) list.push(r)
+      else byWallet.set(r.wallet_address, [r])
+    }
+    const infoPop = wallets.map((w) => w.info_score).sort((a, b) => a - b)
+    return wallets.map((w) => {
+      const events = byWallet.get(w.address) ?? []
+      return {
+        ...w,
+        flow: events.length,
+        series: bucketize(events, (r) => r.timestamp_ms, () => 'v', def, start, end).map((b) => b.total),
+        win_rate: w.trades_count > 0 ? w.win_count / w.trades_count : 0,
+        info_pctl: percentileOf(w.info_score, infoPop),
+      }
+    })
+  }, [wallets, flowRows, def, start, end])
+
+  const filtered = useMemo(() => {
+    const needle = search.trim().toLowerCase()
+    return screened.filter((w) => {
+      if (needle && !w.address.toLowerCase().includes(needle) && !(w.label ?? '').toLowerCase().includes(needle)) return false
+      if (labeledOnly && !w.label) return false
+      if (activeOnly && w.flow === 0) return false
+      return true
+    })
+  }, [screened, search, labeledOnly, activeOnly])
+
+  const sorted = useMemo(() => {
+    const dir = desc ? -1 : 1
+    return [...filtered].sort((a, b) => (Number(a[sortKey]) - Number(b[sortKey])) * dir)
+  }, [filtered, sortKey, desc])
+
+  const sortCol = COLUMNS.find((c) => c.key === sortKey)!
+  const barMax = useMemo(() => {
+    const vals = filtered.map((w) => Number(w[sortKey]))
+    return Math.max(1, ...vals)
+  }, [filtered, sortKey])
+  const distribution = useMemo(() => filtered.map((w) => Number(w[sortKey])), [filtered, sortKey])
+
+  const onSort = (k: SortKey) => {
+    if (k === sortKey) setDesc((d) => !d)
+    else { setSortKey(k); setDesc(true) }
+  }
 
   return (
-    <div className="space-y-4">
-      <div className="flex flex-wrap items-center justify-between border-b border-sentinel-border pb-2">
-        <h2 className="text-sm font-bold font-heading text-sentinel-accent uppercase tracking-widest">WALLET_REGISTRY</h2>
+    <div>
+      <FilterBar title="WALLET SCREENER">
         <input
-          placeholder="SEARCH 0X..."
+          placeholder="0xADDRESS or label…"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
-          className="ml-auto border border-sentinel-border bg-sentinel-bg px-2 py-1.5 font-mono text-xs outline-none focus:border-sentinel-accent"
+          className="border border-sentinel-border bg-sentinel-bg px-2 py-1 font-mono text-xs outline-none placeholder:text-slate-700 focus:border-sentinel-accent"
         />
-      </div>
+        <Toggle on={labeledOnly} onClick={() => setLabeledOnly((v) => !v)} label="Labeled" />
+        <Toggle on={activeOnly} onClick={() => setActiveOnly((v) => !v)} label={`Active in ${def.label}`} />
+        <span className="font-mono text-[10px] uppercase text-slate-600">
+          {compact(sorted.length)} / {compact(screened.length)} wallets
+        </span>
+      </FilterBar>
 
-      <div className="overflow-x-auto border border-sentinel-border bg-sentinel-panel">
-        <table className="w-full text-xs font-mono whitespace-nowrap">
-          <thead className="bg-sentinel-border/30 text-left text-[10px] uppercase tracking-wider text-slate-400 border-b border-sentinel-border">
-            <tr>
-              <th className="px-3 py-2 font-normal">Wallet</th>
-              {COLUMNS.map((c) => (
-                <th
-                  key={c.key}
-                  onClick={() => setSortKey(c.key)}
-                  className={`cursor-pointer px-3 py-2 hover:text-slate-200 transition-colors font-normal ${sortKey === c.key ? 'text-sentinel-accent' : ''}`}
-                >
-                  {c.label} {sortKey === c.key ? '▼' : ''}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {loading && <tr><td colSpan={7} className="px-3 py-6 text-center text-slate-500">LOADING_REGISTRY...</td></tr>}
-            {!loading && rows.length === 0 && (
-              <tr><td colSpan={7} className="px-3 py-6 text-center text-slate-500">NO_DATA (RUN SYNC SCRIPT)</td></tr>
-            )}
-            {rows.map((w) => (
-              <tr key={w.address} className="border-b border-sentinel-border/50 hover:bg-sentinel-border/30 transition-colors">
-                <td className="px-3 py-2 font-mono">
-                  <Link to={`/wallet/${w.address}`} className="text-sentinel-accent hover:underline">
-                    {shortAddress(w.address)}
-                  </Link>
-                  {w.label && <span className="ml-2 border border-sentinel-destructive px-1 text-[9px] text-sentinel-destructive">{w.label}</span>}
-                </td>
-                <td className="px-3 py-2">{w.info_score.toFixed(1)}</td>
-                <td className="px-3 py-2 text-sentinel-destructive">{w.suspicious_score.toFixed(2)}</td>
-                <td className="px-3 py-2 text-purple-400">{w.forensic_score.toFixed(2)}</td>
-                <td className={`px-3 py-2 ${w.roi_estimate >= 0 ? 'text-sentinel-accent' : 'text-sentinel-destructive'}`}>{(w.roi_estimate * 100).toFixed(0)}%</td>
-                <td className="px-3 py-2">{w.trades_count}</td>
-                <td className="px-3 py-2 text-slate-300">{Math.round(w.total_volume).toLocaleString('en-US')}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      <div className="space-y-3">
+        <Panel
+          title={`Distribution · ${sortCol.label}`}
+          meta={`n=${filtered.length} · sorted ${desc ? 'desc' : 'asc'}`}
+          loading={loading}
+          table={{
+            columns: ['Percentile', sortCol.label],
+            rows: [10, 25, 50, 75, 90, 99].map((p) => [`p${p}`, quantile(distribution, p).toFixed(2)]),
+          }}
+        >
+          <div className="px-3 pb-2 pt-1">
+            <Histogram
+              values={distribution}
+              color={SERIES[0]}
+              height={92}
+              format={(v) => (Math.abs(v) >= 1000 ? compact(v) : v.toFixed(1))}
+              marker={sorted[0] ? Number(sorted[0][sortKey]) : null}
+              markerLabel={sorted[0] ? shortAddress(sorted[0].address) : undefined}
+            />
+          </div>
+        </Panel>
+
+        <Panel
+          title="Registry"
+          meta={`click a header to sort · ${def.label} flow`}
+          loading={loading}
+          table={{
+            columns: ['Wallet', ...COLUMNS.map((c) => c.label)],
+            rows: sorted.map((w) => [w.address, ...COLUMNS.map((c) => c.format(w))]),
+          }}
+        >
+          <div className="overflow-x-auto">
+            <table className="w-full whitespace-nowrap text-[11px]">
+              <thead className="border-b border-sentinel-border text-left font-mono text-[9px] uppercase tracking-wider text-slate-500">
+                <tr>
+                  <th className="px-3 py-1.5 font-normal">Wallet</th>
+                  <th className="px-3 py-1.5 font-normal">Shape</th>
+                  {COLUMNS.map((c) => (
+                    <th
+                      key={c.key}
+                      onClick={() => onSort(c.key)}
+                      aria-sort={sortKey === c.key ? (desc ? 'descending' : 'ascending') : 'none'}
+                      className={`cursor-pointer px-3 py-1.5 text-right font-normal transition-colors hover:text-slate-200 ${
+                        c.hideOnMobile ? 'hidden lg:table-cell' : ''
+                      } ${sortKey === c.key ? 'text-sentinel-accent' : ''}`}
+                    >
+                      {c.label}
+                      <span className="ml-1 inline-block w-2">{sortKey === c.key ? (desc ? '▼' : '▲') : ''}</span>
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {!loading && sorted.length === 0 && (
+                  <tr><td colSpan={COLUMNS.length + 2} className="px-3 py-6 text-center font-mono text-[10px] uppercase text-slate-600">no wallets match the screen</td></tr>
+                )}
+                {sorted.map((w) => (
+                  <tr key={w.address} className="border-b border-sentinel-border/40 hover:bg-white/[0.03]">
+                    <td className="px-3 py-1.5">
+                      <Link to={`/wallet/${w.address}`} className="font-mono text-sentinel-accent hover:underline">
+                        {shortAddress(w.address)}
+                      </Link>
+                      {w.label && (
+                        <span className="ml-2 border px-1 font-mono text-[9px] uppercase" style={{ borderColor: STATUS.critical, color: STATUS.critical }}>
+                          {w.label}
+                        </span>
+                      )}
+                      <span className="ml-2 font-mono text-[9px] text-slate-600">p{Math.round(w.info_pctl * 100)}</span>
+                    </td>
+                    <td className="px-3 py-1">
+                      <Sparkline values={w.series} color={SERIES[0]} width={64} height={14} label={`${w.address} flow`} />
+                    </td>
+                    {COLUMNS.map((c) => {
+                      const raw = Number(w[c.key])
+                      const isSorted = sortKey === c.key
+                      return (
+                        <td
+                          key={c.key}
+                          className={`num px-3 py-1.5 text-right ${c.hideOnMobile ? 'hidden lg:table-cell' : ''} ${
+                            isSorted ? 'text-slate-100' : 'text-slate-400'
+                          }`}
+                        >
+                          <span className="inline-flex items-center justify-end gap-2">
+                            {c.bar && (
+                              <MiniBar
+                                value={raw / (c.max ?? barMax)}
+                                color={isSorted ? SERIES[0] : SERIES[2]}
+                                width={32}
+                                title={`${c.label} ${c.format(w)}`}
+                              />
+                            )}
+                            <span style={c.key === 'roi_estimate' || c.key === 'total_profit'
+                              ? { color: raw > 0 ? STATUS.good : raw < 0 ? STATUS.critical : undefined }
+                              : undefined}
+                            >
+                              {(c.key === 'roi_estimate' || c.key === 'total_profit') && raw !== 0
+                                ? `${raw > 0 ? '▲' : '▼'} ${c.format(w).replace('-', '')}`
+                                : c.format(w)}
+                            </span>
+                          </span>
+                        </td>
+                      )
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Panel>
       </div>
     </div>
+  )
+}
+
+function Toggle({ on, onClick, label }: { on: boolean; onClick: () => void; label: string }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={on}
+      className={`border px-2 py-1 font-mono text-[10px] uppercase tracking-wider transition-colors ${
+        on
+          ? 'border-sentinel-accent bg-sentinel-accent/10 text-sentinel-accent'
+          : 'border-sentinel-border text-slate-500 hover:text-slate-200'
+      }`}
+    >
+      {on ? '✓ ' : ''}{label}
+    </button>
   )
 }
