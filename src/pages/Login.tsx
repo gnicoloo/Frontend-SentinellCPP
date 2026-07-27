@@ -21,40 +21,44 @@ export default function Login() {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center">
+    <div className="flex min-h-screen items-center justify-center bg-sentinel-bg">
       <form
         onSubmit={onSubmit}
-        className="w-full max-w-sm rounded-lg border border-sentinel-border bg-sentinel-panel p-6"
+        className="w-full max-w-sm border border-sentinel-border bg-sentinel-panel p-6 shadow-2xl"
       >
-        <h1 className="mb-1 text-xl font-bold text-sentinel-accent">🛰️ Sentinel</h1>
-        <p className="mb-5 text-sm text-slate-500">Accedi con il tuo account Supabase</p>
-        <label className="mb-3 block text-sm">
-          Email
+        <h1 className="mb-1 text-xl font-bold text-sentinel-accent font-heading">SENTINEL_SYS</h1>
+        <p className="mb-6 text-xs text-slate-500 font-mono tracking-widest uppercase">Authorized Personnel Only</p>
+        
+        <label className="mb-3 block text-[10px] font-mono text-slate-400 uppercase tracking-wider">
+          Email Address
           <input
             type="email"
             required
             value={email}
             onChange={(e) => setEmail(e.target.value)}
-            className="mt-1 w-full rounded border border-sentinel-border bg-sentinel-bg px-3 py-2 outline-none focus:border-sentinel-accent"
+            className="mt-1 w-full border border-sentinel-border bg-sentinel-bg px-3 py-2 text-sm font-mono text-slate-200 outline-none focus:border-sentinel-accent focus:ring-1 focus:ring-sentinel-accent transition-colors"
           />
         </label>
-        <label className="mb-4 block text-sm">
+        
+        <label className="mb-6 block text-[10px] font-mono text-slate-400 uppercase tracking-wider">
           Password
           <input
             type="password"
             required
             value={password}
             onChange={(e) => setPassword(e.target.value)}
-            className="mt-1 w-full rounded border border-sentinel-border bg-sentinel-bg px-3 py-2 outline-none focus:border-sentinel-accent"
+            className="mt-1 w-full border border-sentinel-border bg-sentinel-bg px-3 py-2 text-sm font-mono text-slate-200 outline-none focus:border-sentinel-accent focus:ring-1 focus:ring-sentinel-accent transition-colors"
           />
         </label>
-        {error && <p className="mb-3 text-sm text-red-400">{error}</p>}
+        
+        {error && <p className="mb-4 text-xs font-mono text-sentinel-destructive">ERR: {error}</p>}
+        
         <button
           type="submit"
           disabled={busy}
-          className="w-full rounded bg-sentinel-accent px-3 py-2 font-semibold text-sentinel-bg hover:bg-sky-300 disabled:opacity-50"
+          className="w-full bg-sentinel-accent px-3 py-2 text-xs font-bold font-mono tracking-widest text-sentinel-bg hover:bg-green-400 disabled:opacity-50 transition-colors uppercase"
         >
-          {busy ? 'Accesso…' : 'Login'}
+          {busy ? 'Authenticating...' : 'Login'}
         </button>
       </form>
     </div>

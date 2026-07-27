@@ -5,11 +5,17 @@ export default {
     extend: {
       colors: {
         sentinel: {
-          bg: '#0b1220',
-          panel: '#111a2c',
-          border: '#1e2a44',
-          accent: '#38bdf8',
+          bg: '#020617',
+          panel: '#0F172A',
+          border: '#334155',
+          accent: '#22C55E',
+          destructive: '#EF4444',
         },
+      },
+      fontFamily: {
+        sans: ['"Source Sans 3"', 'sans-serif'],
+        heading: ['Lexend', 'sans-serif'],
+        mono: ['"JetBrains Mono"', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'Monaco', 'Consolas', 'monospace'],
       },
     },
   },

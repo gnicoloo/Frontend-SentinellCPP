@@ -60,12 +60,14 @@ export default function AlertExplorer() {
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-center gap-3">
-        <h2 className="text-xl font-bold">Alert Explorer</h2>
-        <span className="text-sm text-slate-500">{total} alert</span>
-        <div className="ml-auto flex gap-2">
-          <button onClick={exportCsv} className="rounded border border-sentinel-border px-3 py-1 text-sm hover:bg-white/5">Export CSV</button>
-          <button onClick={exportJson} className="rounded border border-sentinel-border px-3 py-1 text-sm hover:bg-white/5">Export JSON</button>
+      <div className="flex flex-wrap items-center justify-between border-b border-sentinel-border pb-2">
+        <h2 className="text-sm font-bold font-heading text-sentinel-accent uppercase tracking-widest">ALERT_EXPLORER</h2>
+        <div className="flex items-center gap-4">
+          <span className="text-[10px] font-mono text-slate-500">{total} RECORDS</span>
+          <div className="flex gap-2">
+            <button onClick={exportCsv} className="border border-sentinel-border px-2 py-1 text-[10px] font-mono uppercase hover:bg-sentinel-border/50 transition-colors">CSV</button>
+            <button onClick={exportJson} className="border border-sentinel-border px-2 py-1 text-[10px] font-mono uppercase hover:bg-sentinel-border/50 transition-colors">JSON</button>
+          </div>
         </div>
       </div>
 
@@ -73,63 +75,66 @@ export default function AlertExplorer() {
         <select
           value={typeFilter}
           onChange={(e) => { setPage(0); setTypeFilter(e.target.value) }}
-          className="rounded border border-sentinel-border bg-sentinel-panel px-3 py-1.5 text-sm"
+          className="border border-sentinel-border bg-sentinel-bg px-2 py-1.5 text-xs font-mono outline-none focus:border-sentinel-accent"
         >
-          <option value="">Tutti i tipi</option>
+          <option value="">ALL_TYPES</option>
           {Object.entries(ALERT_TYPE_LABELS).map(([value, label]) => (
-            <option key={value} value={value}>{label}</option>
+            <option key={value} value={value}>{label.toUpperCase()}</option>
           ))}
         </select>
         <input
-          placeholder="Wallet 0x…"
+          placeholder="WALLET_0X..."
           value={walletFilter}
           onChange={(e) => { setPage(0); setWalletFilter(e.target.value) }}
-          className="rounded border border-sentinel-border bg-sentinel-panel px-3 py-1.5 font-mono text-sm"
+          className="border border-sentinel-border bg-sentinel-bg px-2 py-1.5 text-xs font-mono outline-none focus:border-sentinel-accent"
         />
         <input
-          placeholder="Mercato…"
+          placeholder="MARKET_ID..."
           value={marketFilter}
           onChange={(e) => { setPage(0); setMarketFilter(e.target.value) }}
-          className="rounded border border-sentinel-border bg-sentinel-panel px-3 py-1.5 text-sm"
+          className="border border-sentinel-border bg-sentinel-bg px-2 py-1.5 text-xs font-mono outline-none focus:border-sentinel-accent"
         />
         <input
           type="date"
           value={dateFrom}
           onChange={(e) => { setPage(0); setDateFrom(e.target.value) }}
-          className="rounded border border-sentinel-border bg-sentinel-panel px-3 py-1.5 text-sm"
+          className="border border-sentinel-border bg-sentinel-bg px-2 py-1.5 text-xs font-mono outline-none focus:border-sentinel-accent"
         />
       </div>
 
-      <div className="overflow-x-auto rounded-lg border border-sentinel-border">
-        <table className="w-full text-sm">
-          <thead className="bg-sentinel-panel text-left text-xs uppercase text-slate-500">
+      <div className="overflow-x-auto border border-sentinel-border bg-sentinel-panel">
+        <table className="w-full text-xs font-mono whitespace-nowrap">
+          <thead className="bg-sentinel-border/30 text-left text-[10px] uppercase tracking-wider text-slate-400 border-b border-sentinel-border">
             <tr>
-              <th className="px-3 py-2">Tipo</th>
-              <th className="px-3 py-2">Wallet</th>
-              <th className="px-3 py-2">Mercato</th>
-              <th className="px-3 py-2">Quando</th>
+              <th className="px-3 py-2 font-normal">Type</th>
+              <th className="px-3 py-2 font-normal">Wallet</th>
+              <th className="px-3 py-2 font-normal">Market/Asset</th>
+              <th className="px-3 py-2 font-normal">Timestamp</th>
             </tr>
           </thead>
           <tbody>
             {loading && (
-              <tr><td colSpan={4} className="px-3 py-6 text-center text-slate-500">Caricamento…</td></tr>
+              <tr><td colSpan={4} className="px-3 py-6 text-center text-slate-500">LOADING_DATA...</td></tr>
             )}
             {!loading && rows.length === 0 && (
-              <tr><td colSpan={4} className="px-3 py-6 text-center text-slate-500">Nessun alert con questi filtri.</td></tr>
+              <tr><td colSpan={4} className="px-3 py-6 text-center text-slate-500">NO_RECORDS_FOUND</td></tr>
             )}
             {rows.map((r) => (
               <tr
                 key={`${r.source_table}-${r.source_rowid}`}
                 onClick={() => setSelected(r)}
-                className="cursor-pointer border-t border-sentinel-border hover:bg-white/5"
+                className="cursor-pointer border-b border-sentinel-border/50 hover:bg-sentinel-border/30 transition-colors"
               >
                 <td className="px-3 py-2">
-                  <span className="rounded px-2 py-0.5 text-xs font-semibold" style={{ background: `${ALERT_TYPE_COLORS[r.alert_type] ?? '#64748b'}22`, color: ALERT_TYPE_COLORS[r.alert_type] ?? '#94a3b8' }}>
+                  <span className="border px-1 py-0.5 text-[9px] font-bold uppercase" style={{ 
+                      borderColor: ALERT_TYPE_COLORS[r.alert_type] === '#38bdf8' ? '#22C55E' : ALERT_TYPE_COLORS[r.alert_type] ?? '#64748b', 
+                      color: ALERT_TYPE_COLORS[r.alert_type] === '#38bdf8' ? '#22C55E' : ALERT_TYPE_COLORS[r.alert_type] ?? '#94a3b8' 
+                    }}>
                     {ALERT_TYPE_LABELS[r.alert_type] ?? r.alert_type}
                   </span>
                 </td>
-                <td className="px-3 py-2 font-mono">{shortAddress(r.wallet_address)}</td>
-                <td className="max-w-xs truncate px-3 py-2 text-slate-400">{r.market_title ?? r.asset_id ?? '—'}</td>
+                <td className="px-3 py-2 text-sentinel-accent">{shortAddress(r.wallet_address)}</td>
+                <td className="max-w-[150px] md:max-w-xs truncate px-3 py-2 text-slate-300">{r.market_title ?? r.asset_id ?? '---'}</td>
                 <td className="px-3 py-2 text-slate-500">{formatTs(r.timestamp_ms)}</td>
               </tr>
             ))}
@@ -137,27 +142,27 @@ export default function AlertExplorer() {
         </table>
       </div>
 
-      <div className="flex items-center gap-3 text-sm">
-        <button disabled={page === 0} onClick={() => setPage((p) => p - 1)} className="rounded border border-sentinel-border px-3 py-1 disabled:opacity-40">← Prec</button>
-        <span className="text-slate-500">pagina {page + 1} / {pages}</span>
-        <button disabled={page + 1 >= pages} onClick={() => setPage((p) => p + 1)} className="rounded border border-sentinel-border px-3 py-1 disabled:opacity-40">Succ →</button>
+      <div className="flex items-center gap-3 text-xs font-mono">
+        <button disabled={page === 0} onClick={() => setPage((p) => p - 1)} className="border border-sentinel-border px-2 py-1 disabled:opacity-40 hover:bg-sentinel-border/50">{'<'} PREV</button>
+        <span className="text-slate-500">PAGE {page + 1} OF {pages}</span>
+        <button disabled={page + 1 >= pages} onClick={() => setPage((p) => p + 1)} className="border border-sentinel-border px-2 py-1 disabled:opacity-40 hover:bg-sentinel-border/50">NEXT {'>'}</button>
       </div>
 
       {selected && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6" onClick={() => setSelected(null)}>
-          <div className="max-h-[80vh] w-full max-w-2xl overflow-auto rounded-lg border border-sentinel-border bg-sentinel-panel p-5" onClick={(e) => e.stopPropagation()}>
-            <div className="mb-3 flex items-center justify-between">
-              <h3 className="font-semibold">
-                {ALERT_TYPE_LABELS[selected.alert_type] ?? selected.alert_type} — {shortAddress(selected.wallet_address)}
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4" onClick={() => setSelected(null)}>
+          <div className="max-h-[80vh] w-full max-w-2xl overflow-auto border border-sentinel-border bg-sentinel-bg shadow-2xl p-4" onClick={(e) => e.stopPropagation()}>
+            <div className="mb-4 flex items-center justify-between border-b border-sentinel-border pb-2">
+              <h3 className="text-xs font-bold font-mono text-sentinel-accent uppercase">
+                {ALERT_TYPE_LABELS[selected.alert_type] ?? selected.alert_type} // {shortAddress(selected.wallet_address)}
               </h3>
-              <button onClick={() => setSelected(null)} className="text-slate-500 hover:text-slate-200">✕</button>
+              <button onClick={() => setSelected(null)} className="text-slate-500 hover:text-slate-200 font-mono text-[10px]">[X] CLOSE</button>
             </div>
             {typeof selected.payload?.market_url === 'string' && (
-              <a href={selected.payload.market_url as string} target="_blank" rel="noreferrer" className="mb-3 block text-sm text-sentinel-accent hover:underline">
-                Apri mercato su Polymarket ↗
+              <a href={selected.payload.market_url as string} target="_blank" rel="noreferrer" className="mb-4 inline-block text-[10px] font-mono text-sentinel-accent hover:underline uppercase border border-sentinel-accent/50 px-2 py-1">
+                {'>>'} OPEN_MARKET
               </a>
             )}
-            <pre className="overflow-x-auto rounded bg-sentinel-bg p-3 text-xs text-slate-300">
+            <pre className="overflow-x-auto border border-sentinel-border bg-sentinel-panel p-3 text-[10px] font-mono text-slate-300">
               {JSON.stringify(selected.payload, null, 2)}
             </pre>
           </div>

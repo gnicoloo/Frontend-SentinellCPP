@@ -15,9 +15,6 @@ interface GraphLink extends d3.SimulationLinkDatum<GraphNode> {
 
 const CLUSTER_COLORS = ['#38bdf8', '#f87171', '#34d399', '#fbbf24', '#a78bfa', '#fb923c', '#e879f9', '#94a3b8']
 
-// Costruisce il grafo dai cluster_move / co-occorrenze wallet-mercato degli
-// alert sincronizzati: due wallet sono collegati se compaiono su alert dello
-// stesso asset. In assenza di dati usa un piccolo grafo dimostrativo.
 function buildGraph(alerts: AlertRow[]): { nodes: GraphNode[]; links: GraphLink[] } {
   const byAsset = new Map<string, Set<string>>()
   const scores = new Map<string, number>()
@@ -47,7 +44,6 @@ function buildGraph(alerts: AlertRow[]): { nodes: GraphNode[]; links: GraphLink[
   }
 
   if (connected.size === 0) {
-    // Dati insufficienti: grafo demo per mostrare l'interazione.
     const demo = ['0xdemo-a', '0xdemo-b', '0xdemo-c', '0xdemo-d', '0xdemo-e', '0xdemo-f']
     return {
       nodes: demo.map((id, i) => ({ id, cluster: i < 3 ? 0 : 1, score: 2 + (i % 3) })),
@@ -61,7 +57,6 @@ function buildGraph(alerts: AlertRow[]): { nodes: GraphNode[]; links: GraphLink[
     }
   }
 
-  // Cluster = componenti connesse (union-find minimale).
   const parent = new Map<string, string>()
   const find = (x: string): string => {
     let root = x
@@ -145,8 +140,8 @@ export default function ClusterGraph() {
       .join('circle')
       .attr('r', (d) => 6 + Math.min(10, d.score))
       .attr('fill', (d) => CLUSTER_COLORS[d.cluster % CLUSTER_COLORS.length])
-      .attr('stroke', '#0b1220')
-      .attr('stroke-width', 1.5)
+      .attr('stroke', '#020617')
+      .attr('stroke-width', 2)
       .style('cursor', 'pointer')
       .on('click', (_event, d) => {
         if (!d.id.startsWith('0xdemo')) navigate(`/wallet/${d.id}`)
@@ -177,8 +172,9 @@ export default function ClusterGraph() {
       .data(graph.nodes)
       .join('text')
       .text((d) => shortAddress(d.id))
-      .attr('font-size', 9)
-      .attr('fill', '#64748b')
+      .attr('font-size', 10)
+      .attr('font-family', 'monospace')
+      .attr('fill', '#94a3b8')
       .attr('pointer-events', 'none')
 
     simulation.on('tick', () => {
@@ -200,27 +196,27 @@ export default function ClusterGraph() {
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-center gap-3">
-        <h2 className="text-xl font-bold">Cluster Graph</h2>
-        <span className="text-sm text-slate-500">
-          {graph.nodes.length} wallet · {graph.links.length} archi · {clusterCount} cluster
+      <div className="flex flex-wrap items-center gap-3 border-b border-sentinel-border pb-2">
+        <h2 className="text-sm font-bold font-heading text-sentinel-accent uppercase tracking-widest">NETWORK_GRAPH</h2>
+        <span className="text-[10px] font-mono text-slate-500 uppercase tracking-widest ml-auto">
+          {graph.nodes.length} N / {graph.links.length} L / {clusterCount} C
         </span>
         {demo && (
-          <span className="rounded bg-amber-400/15 px-2 py-0.5 text-xs text-amber-300">
-            dati demo — sincronizza alert con wallet per il grafo reale
+          <span className="border border-sentinel-destructive px-2 py-0.5 text-[10px] font-mono text-sentinel-destructive uppercase">
+            [DEMO_MODE] RUN_SYNC_SCRIPT
           </span>
         )}
       </div>
-      <p className="text-sm text-slate-500">
-        Zoom con la rotella, trascina i nodi, click su un wallet per aprire la scheda. Archi = co-presenza su alert dello stesso mercato.
+      <p className="text-[10px] font-mono text-slate-500 uppercase">
+        SCROLL TO ZOOM / DRAG NODES / CLICK WALLET TO OPEN / LINKS = CO-OCCURRENCE ON SAME ASSET
       </p>
-      <div className="rounded-lg border border-sentinel-border bg-sentinel-panel">
-        <svg ref={svgRef} className="h-[560px] w-full" />
+      <div className="border border-sentinel-border bg-sentinel-bg">
+        <svg ref={svgRef} className="h-[560px] w-full" style={{ background: '#020617' }} />
       </div>
-      <div className="flex flex-wrap gap-3 text-xs text-slate-400">
+      <div className="flex flex-wrap gap-3 text-[10px] font-mono text-slate-400">
         {CLUSTER_COLORS.slice(0, Math.min(clusterCount, CLUSTER_COLORS.length)).map((c, i) => (
-          <span key={c} className="flex items-center gap-1.5">
-            <span className="inline-block h-3 w-3 rounded-full" style={{ background: c }} /> cluster {i + 1}
+          <span key={c} className="flex items-center gap-1.5 uppercase">
+            <span className="inline-block h-2 w-2" style={{ background: c }} /> CLUSTER_{i + 1}
           </span>
         ))}
       </div>

@@ -18,9 +18,9 @@ interface Kpis {
 
 function KpiCard({ label, value, accent }: { label: string; value: number | string; accent?: string }) {
   return (
-    <div className="rounded-lg border border-sentinel-border bg-sentinel-panel p-4">
-      <p className="text-xs uppercase tracking-wide text-slate-500">{label}</p>
-      <p className="mt-1 text-2xl font-bold" style={{ color: accent ?? '#e2e8f0' }}>
+    <div className="border-l-2 border-sentinel-border bg-sentinel-panel p-3" style={{ borderLeftColor: accent ?? '#334155' }}>
+      <p className="text-[10px] uppercase font-mono tracking-wider text-slate-500">{label}</p>
+      <p className="mt-1 text-xl font-mono" style={{ color: accent ?? '#e2e8f0' }}>
         {value}
       </p>
     </div>
@@ -60,7 +60,6 @@ export default function Dashboard() {
 
   useEffect(() => {
     void load()
-    // Realtime: ogni INSERT su alerts aggiorna feed e contatori.
     const channel = supabase
       .channel('alerts-feed')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'alerts' }, (payload) => {
@@ -88,68 +87,79 @@ export default function Dashboard() {
   }, [weekAlerts])
 
   return (
-    <div className="space-y-6">
-      <h2 className="text-xl font-bold">Dashboard</h2>
-
-      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-        <KpiCard label="Alert (24h)" value={kpis.alerts24h} accent="#38bdf8" />
-        <KpiCard label="Wallet tracciati" value={kpis.walletsTracked} />
-        <KpiCard label="TWAP rilevati" value={kpis.twapDetected} accent="#38bdf8" />
-        <KpiCard label="Suspect trade" value={kpis.suspectTrades} accent="#f87171" />
+    <div className="space-y-4">
+      <div className="flex items-center justify-between border-b border-sentinel-border pb-2">
+        <h2 className="text-sm font-bold font-heading text-sentinel-accent uppercase tracking-widest">SYS_DASHBOARD</h2>
+        <span className="text-[10px] font-mono text-slate-500 animate-pulse">LIVE 🔴</span>
       </div>
 
-      <div className="grid gap-6 lg:grid-cols-2">
-        <div className="rounded-lg border border-sentinel-border bg-sentinel-panel p-4">
-          <h3 className="mb-3 text-sm font-semibold text-slate-400">Alert per tipo — ultimi 7 giorni</h3>
-          <div className="h-64">
+      <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
+        <KpiCard label="Alert (24h)" value={kpis.alerts24h} accent="#22C55E" />
+        <KpiCard label="Wallets Tracked" value={kpis.walletsTracked} />
+        <KpiCard label="TWAP Detected" value={kpis.twapDetected} accent="#22C55E" />
+        <KpiCard label="Suspect Trade" value={kpis.suspectTrades} accent="#EF4444" />
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <div className="border border-sentinel-border bg-sentinel-panel p-3">
+          <h3 className="mb-3 border-b border-sentinel-border pb-2 text-[10px] uppercase font-mono tracking-widest text-slate-400">7-Day Alert Activity</h3>
+          <div className="h-56">
             <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={chartData}>
-                <CartesianGrid stroke="#1e2a44" vertical={false} />
-                <XAxis dataKey="day" stroke="#64748b" fontSize={12} />
-                <YAxis stroke="#64748b" fontSize={12} allowDecimals={false} />
-                <Tooltip contentStyle={{ background: '#111a2c', border: '1px solid #1e2a44' }} />
-                <Legend />
+              <BarChart data={chartData} margin={{ top: 5, right: 0, left: -20, bottom: 0 }}>
+                <CartesianGrid stroke="#334155" vertical={false} strokeDasharray="3 3" />
+                <XAxis dataKey="day" stroke="#64748b" fontSize={10} tickLine={false} axisLine={false} fontFamily="monospace" />
+                <YAxis stroke="#64748b" fontSize={10} allowDecimals={false} tickLine={false} axisLine={false} fontFamily="monospace" />
+                <Tooltip 
+                  contentStyle={{ background: '#020617', border: '1px solid #334155', fontSize: '10px', fontFamily: 'monospace' }} 
+                  itemStyle={{ padding: 0 }}
+                />
+                <Legend wrapperStyle={{ fontSize: '10px', fontFamily: 'monospace' }} />
                 {Object.keys(ALERT_TYPE_LABELS).map((type) => (
-                  <Bar key={type} dataKey={type} stackId="a" name={ALERT_TYPE_LABELS[type]} fill={ALERT_TYPE_COLORS[type]} />
+                  <Bar key={type} dataKey={type} stackId="a" name={ALERT_TYPE_LABELS[type]} fill={ALERT_TYPE_COLORS[type] === '#38bdf8' ? '#22C55E' : ALERT_TYPE_COLORS[type]} />
                 ))}
               </BarChart>
             </ResponsiveContainer>
           </div>
         </div>
 
-        <div className="rounded-lg border border-sentinel-border bg-sentinel-panel p-4">
-          <h3 className="mb-3 text-sm font-semibold text-slate-400">Top 5 wallet per info score</h3>
-          {topWallets.length === 0 && <p className="text-sm text-slate-500">Nessun wallet sincronizzato.</p>}
-          <ul className="space-y-2">
-            {topWallets.map((w) => (
-              <li key={w.address} className="flex items-center justify-between rounded bg-white/5 px-3 py-2 text-sm">
-                <Link to={`/wallet/${w.address}`} className="font-mono text-sentinel-accent hover:underline">
-                  {shortAddress(w.address)}
-                </Link>
-                <span className="text-slate-400">
-                  info <b className="text-slate-200">{w.info_score.toFixed(1)}</b> · {w.trades_count} trade
-                </span>
-              </li>
-            ))}
-          </ul>
+        <div className="border border-sentinel-border bg-sentinel-panel flex flex-col">
+          <h3 className="border-b border-sentinel-border p-3 pb-2 text-[10px] uppercase font-mono tracking-widest text-slate-400">Top Wallets [INFO_SCORE]</h3>
+          <div className="flex-1 overflow-auto p-3 pt-2">
+            {topWallets.length === 0 && <p className="text-[10px] font-mono text-slate-500">NO DATA</p>}
+            <ul className="space-y-1">
+              {topWallets.map((w) => (
+                <li key={w.address} className="flex items-center justify-between bg-sentinel-bg px-2 py-1.5 text-xs hover:bg-sentinel-border/50 border border-transparent hover:border-sentinel-border transition-colors">
+                  <Link to={`/wallet/${w.address}`} className="font-mono text-sentinel-accent hover:underline text-[10px]">
+                    {shortAddress(w.address)}
+                  </Link>
+                  <span className="text-slate-400 font-mono text-[10px] text-right">
+                    SCORE:<b className="text-slate-200 ml-1">{w.info_score.toFixed(1)}</b> <span className="text-slate-600 mx-1">|</span> {w.trades_count} TX
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
         </div>
       </div>
 
-      <div className="rounded-lg border border-sentinel-border bg-sentinel-panel p-4">
-        <h3 className="mb-3 text-sm font-semibold text-slate-400">Activity feed — ultimi alert</h3>
-        {recent.length === 0 && <p className="text-sm text-slate-500">Nessun alert ancora.</p>}
-        <ul className="max-h-80 space-y-1 overflow-y-auto">
+      <div className="border border-sentinel-border bg-sentinel-panel">
+        <h3 className="border-b border-sentinel-border p-3 pb-2 text-[10px] uppercase font-mono tracking-widest text-slate-400">Live Activity Feed</h3>
+        {recent.length === 0 && <p className="p-3 text-[10px] font-mono text-slate-500">AWAITING EVENTS...</p>}
+        <ul className="max-h-64 overflow-y-auto">
           {recent.map((a) => (
-            <li key={`${a.source_table}-${a.source_rowid}`} className="flex items-center gap-3 rounded px-3 py-2 text-sm hover:bg-white/5">
+            <li key={`${a.source_table}-${a.source_rowid}`} className="flex items-center gap-2 border-b border-sentinel-border/50 px-3 py-1.5 hover:bg-sentinel-border/30 transition-colors">
+              <span className="shrink-0 text-[10px] font-mono text-slate-500 w-12 text-right">{formatTs(a.timestamp_ms).split(' ')[1] ?? formatTs(a.timestamp_ms)}</span>
               <span
-                className="rounded px-2 py-0.5 text-xs font-semibold"
-                style={{ background: `${ALERT_TYPE_COLORS[a.alert_type] ?? '#64748b'}22`, color: ALERT_TYPE_COLORS[a.alert_type] ?? '#94a3b8' }}
+                className="shrink-0 border px-1 py-0.5 text-[9px] font-mono font-bold uppercase w-20 text-center"
+                style={{ 
+                  borderColor: ALERT_TYPE_COLORS[a.alert_type] === '#38bdf8' ? '#22C55E' : ALERT_TYPE_COLORS[a.alert_type] ?? '#64748b', 
+                  color: ALERT_TYPE_COLORS[a.alert_type] === '#38bdf8' ? '#22C55E' : ALERT_TYPE_COLORS[a.alert_type] ?? '#94a3b8' 
+                }}
               >
                 {ALERT_TYPE_LABELS[a.alert_type] ?? a.alert_type}
               </span>
-              <span className="font-mono text-slate-300">{shortAddress(a.wallet_address)}</span>
-              <span className="min-w-0 flex-1 truncate text-slate-500">{a.market_title ?? a.asset_id ?? ''}</span>
-              <span className="shrink-0 text-xs text-slate-500">{formatTs(a.timestamp_ms)}</span>
+              <span className="shrink-0 font-mono text-sentinel-accent text-[10px] w-24">{shortAddress(a.wallet_address)}</span>
+              <span className="min-w-0 flex-1 truncate text-slate-300 font-mono text-[10px]">{a.market_title ?? a.asset_id ?? 'UNKNOWN_ASSET'}</span>
             </li>
           ))}
         </ul>
