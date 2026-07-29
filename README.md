@@ -26,6 +26,35 @@ costruisce con URL vuoto — l'app parte ma non legge nulla.
 CI (`.github/workflows/ci.yml`) esegue typecheck → test → build su ogni push e PR
 verso `main`.
 
+## Strumenti CTF (`/ctf`)
+
+Unica parte dell'app che non legge da Supabase: parla direttamente con i
+contratti su Polygon PoS tramite MetaMask (`wagmi` + `viem`), senza passare dal
+CLOB off-chain di Polymarket.
+
+| Contratto | Indirizzo |
+| --- | --- |
+| USDC.e (collaterale) | `0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174` |
+| Conditional Token Framework | `0x4D97DCd97eC945f40cF65F87097ACe5EA0476045` |
+
+Gli indirizzi sono costanti compilate in [`src/lib/ctf.ts`](./src/lib/ctf.ts) e
+**non** variabili d'ambiente: un indirizzo di contratto configurabile a runtime è
+un vettore di phishing. Non esiste nessuna chiave privata nel frontend — ogni
+transazione è costruita qui e firmata dall'utente su MetaMask.
+
+I token ID ERC1155 non sono cablati: si derivano on-chain dal `conditionId`
+(`getCollectionId` → `getPositionId` → `balanceOfBatch`), perché il
+`collectionId` è una somma di punti su curva ellittica e non è ricavabile con un
+keccak off-chain. La tendina in `KNOWN_MARKETS` contiene solo segnaposto da
+sostituire; il campo accetta comunque qualsiasi `conditionId` a 32 byte, e la
+pagina verifica con `getOutcomeSlotCount` che la condizione esista davvero prima
+di abilitare le operazioni.
+
+Costo in bundle: `wagmi` + `viem` pesano ~260 kB (~77 kB gzip) sul chunk
+principale, pagati anche da chi non apre mai la pagina. Per isolarli servirebbe
+spostare `WagmiProvider` da `main.tsx` dentro un wrapper caricato con
+`React.lazy` insieme alla pagina.
+
 ## ⚠ Azione manuale richiesta: DDL su Supabase
 
 Lo schema **non viene applicato dall'app**. Il contenuto di

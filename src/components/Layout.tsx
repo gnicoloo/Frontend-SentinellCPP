@@ -8,6 +8,10 @@ const NAV = [
   { to: '/alerts', label: 'Alerts', code: 'AL' },
   { to: '/wallets', label: 'Wallets', code: 'WL' },
   { to: '/clusters', label: 'Clusters', code: 'CG' },
+  // La barra in basso su mobile divide la larghezza per il numero di voci:
+  // oltre le cinque, l'etichetta lunga va a capo. Le voci che ce l'hanno
+  // stampano `short` sul mobile.
+  { to: '/ctf', label: 'Strumenti CTF', short: 'CTF', code: 'CT' },
   { to: '/twap', label: 'Execution', code: 'TW' },
 ]
 
@@ -78,7 +82,7 @@ export default function Layout() {
               }`
             }
           >
-            {item.label}
+            {item.short ?? item.label}
           </NavLink>
         ))}
       </nav>
