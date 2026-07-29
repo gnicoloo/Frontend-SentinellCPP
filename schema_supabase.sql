@@ -309,3 +309,307 @@ create unique index if not exists idx_alert_trades_source on public.alert_trades
 alter table public.alert_trades enable row level security;
 drop policy if exists "read alert_trades" on public.alert_trades;
 create policy "read alert_trades" on public.alert_trades for select to authenticated using (true);
+
+-- ---------------------------------------------------------------------------
+-- Supporting indexes for the aggregates below.
+--
+-- twap_patterns is queried by overlapping window (start_time/end_time) and by
+-- jsonb containment on `wallets`; without these it is a sequential scan that
+-- degrades with every detected window.
+-- ---------------------------------------------------------------------------
+create index if not exists idx_twap_start on public.twap_patterns (start_time);
+create index if not exists idx_twap_end on public.twap_patterns (end_time desc);
+create index if not exists idx_twap_wallets on public.twap_patterns using gin (wallets);
+
+-- ===========================================================================
+-- Aggregates.
+--
+-- WHY THESE EXIST: every chart and KPI used to be computed in the browser from
+-- a capped row fetch (`.order('timestamp_ms', desc).limit(6000)`). Once the
+-- window held more than the cap, Postgres returned only the NEWEST rows, so a
+-- 30-day chart silently drew a single day and every "vs prior window" delta
+-- compared a full window against an empty one. The bug grew with the database.
+--
+-- Aggregating here makes the payload proportional to the number of BUCKETS
+-- (~30 rows), not to the number of alerts, so the figures stay exact at any
+-- table size. All of these are SECURITY INVOKER (the default), so the RLS
+-- select policies above still decide what the caller may read.
+--
+-- Bucket indexing mirrors bucketize() in src/lib/range.ts exactly: the grid is
+-- anchored to the caller's [p_start, p_end] and split into p_buckets equal
+-- slices, with the final bucket closed on the right. The frontend computes
+-- p_buckets from the active range, so both sides always agree on the grid.
+-- ===========================================================================
+
+-- Alert flow per (bucket, alert_type), with the same optional filters the
+-- Alert Explorer applies -- one definition serves the chart on every page.
+-- p_wallet is an EQUALITY match (the wallet detail page, which can then use
+-- idx_alerts_wallet); p_wallet_like is the Explorer's substring search. Keeping
+-- them apart stops the common case from degrading into a full scan.
+create or replace function public.alert_buckets(
+    p_start       bigint,
+    p_end         bigint,
+    p_buckets     integer,
+    p_wallet      text default null,
+    p_wallet_like text default null,
+    p_market      text default null,
+    p_types       text[] default null
+)
+returns table (bucket_index integer, alert_type text, n bigint)
+language sql
+stable
+as $$
+    select
+        least(p_buckets - 1,
+              greatest(0, floor((a.timestamp_ms - p_start)::numeric
+                                * p_buckets / nullif(p_end - p_start, 0))::int)),
+        a.alert_type,
+        count(*)::bigint
+    from public.alerts a
+    where a.timestamp_ms >= p_start
+      and a.timestamp_ms <= p_end
+      and (p_wallet      is null or a.wallet_address = p_wallet)
+      and (p_wallet_like is null or a.wallet_address ilike '%' || p_wallet_like || '%')
+      and (p_market      is null or a.market_title   ilike '%' || p_market || '%')
+      and (p_types       is null or a.alert_type = any(p_types))
+    group by 1, 2
+$$;
+
+-- The KPI row for one window. Called twice (current + prior) so the deltas
+-- compare two exact counts instead of two truncated samples.
+create or replace function public.alert_window_stats(
+    p_start  bigint,
+    p_end    bigint,
+    p_severe text[] default null,
+    p_wallet text default null
+)
+returns table (total bigint, severe bigint, wallets bigint, markets bigint)
+language sql
+stable
+as $$
+    select
+        count(*)::bigint,
+        count(*) filter (
+            where p_severe is not null and a.alert_type = any(p_severe)
+        )::bigint,
+        count(distinct a.wallet_address)::bigint,
+        count(distinct coalesce(a.market_title, a.asset_id))::bigint
+    from public.alerts a
+    where a.timestamp_ms >= p_start
+      and a.timestamp_ms <= p_end
+      and (p_wallet is null or a.wallet_address = p_wallet)
+$$;
+
+-- Top markets ('market') or top wallets ('wallet') by alert flow in a window,
+-- each with its distinct-wallet count and its dominant alert type.
+create or replace function public.alert_top_entities(
+    p_start     bigint,
+    p_end       bigint,
+    p_dimension text,
+    p_limit     integer default 8,
+    p_wallet    text default null
+)
+returns table (key text, total bigint, wallets bigint, dominant text, types text[])
+language sql
+stable
+as $$
+    with scoped as (
+        select
+            case when p_dimension = 'wallet'
+                 then a.wallet_address
+                 else coalesce(a.market_title, a.asset_id)
+            end as key,
+            a.wallet_address,
+            a.alert_type
+        from public.alerts a
+        where a.timestamp_ms >= p_start
+          and a.timestamp_ms <= p_end
+          and (p_wallet is null or a.wallet_address = p_wallet)
+    ),
+    filtered as (
+        select * from scoped where key is not null
+    ),
+    totals as (
+        select f.key,
+               count(*) as total,
+               count(distinct f.wallet_address) as wallets,
+               array_agg(distinct f.alert_type) as types
+        from filtered f
+        group by f.key
+        order by count(*) desc
+        limit p_limit
+    ),
+    by_type as (
+        select f.key, f.alert_type, count(*) as c
+        from filtered f
+        join totals t on t.key = f.key
+        group by f.key, f.alert_type
+    ),
+    -- row_number() rather than distinct on: the tie-breaker `c` does not have
+    -- to appear in the select list, and ties resolve deterministically.
+    dom as (
+        select key, alert_type
+        from (
+            select key, alert_type,
+                   row_number() over (partition by key order by c desc, alert_type) as rn
+            from by_type
+        ) ranked
+        where rn = 1
+    )
+    select t.key, t.total, t.wallets, d.alert_type, t.types
+    from totals t
+    left join dom d on d.key = t.key
+    order by t.total desc
+$$;
+
+-- Bucketed flow for an explicit set of wallets or markets -- the sparklines.
+-- Keyed by an array so a page fetches series only for the rows it renders.
+create or replace function public.alert_entity_series(
+    p_start     bigint,
+    p_end       bigint,
+    p_buckets   integer,
+    p_dimension text,
+    p_keys      text[]
+)
+returns table (key text, bucket_index integer, n bigint)
+language sql
+stable
+as $$
+    select
+        case when p_dimension = 'wallet'
+             then a.wallet_address
+             else coalesce(a.market_title, a.asset_id)
+        end,
+        least(p_buckets - 1,
+              greatest(0, floor((a.timestamp_ms - p_start)::numeric
+                                * p_buckets / nullif(p_end - p_start, 0))::int)),
+        count(*)::bigint
+    from public.alerts a
+    where a.timestamp_ms >= p_start
+      and a.timestamp_ms <= p_end
+      and (case when p_dimension = 'wallet'
+                then a.wallet_address
+                else coalesce(a.market_title, a.asset_id)
+           end) = any(p_keys)
+    group by 1, 2
+$$;
+
+-- Exact alert count per wallet in a window, for the screener's Flow column.
+create or replace function public.alert_wallet_counts(
+    p_start     bigint,
+    p_end       bigint,
+    p_addresses text[]
+)
+returns table (wallet_address text, n bigint)
+language sql
+stable
+as $$
+    select a.wallet_address, count(*)::bigint
+    from public.alerts a
+    where a.timestamp_ms >= p_start
+      and a.timestamp_ms <= p_end
+      and a.wallet_address = any(p_addresses)
+    group by a.wallet_address
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Exposure aggregates. `positions` is a live snapshot with no time dimension,
+-- but it was summed from a capped fetch too, so "capital at risk" understated
+-- the book as soon as the table passed the cap.
+-- ---------------------------------------------------------------------------
+create or replace function public.position_totals()
+returns table (
+    notional   double precision,
+    unrealized double precision,
+    open_legs  bigint,
+    wallets    bigint,
+    tokens     bigint
+)
+language sql
+stable
+as $$
+    select
+        coalesce(sum(p.notional_usd), 0)::double precision,
+        coalesce(sum(p.unrealized_pnl), 0)::double precision,
+        count(*) filter (where p.net_contracts <> 0)::bigint,
+        count(distinct p.wallet_address)::bigint,
+        count(distinct coalesce(p.condition_id, p.asset_id))::bigint
+    from public.positions p
+$$;
+
+create or replace function public.position_top_markets(p_limit integer default 8)
+returns table (
+    name       text,
+    notional   double precision,
+    unrealized double precision,
+    wallets    bigint,
+    dominant   text
+)
+language sql
+stable
+as $$
+    with scoped as (
+        select coalesce(p.market_title, p.asset_id) as name,
+               p.wallet_address, p.outcome, p.notional_usd, p.unrealized_pnl
+        from public.positions p
+    ),
+    totals as (
+        select s.name,
+               sum(s.notional_usd)   as notional,
+               sum(s.unrealized_pnl) as unrealized,
+               count(distinct s.wallet_address) as wallets
+        from scoped s
+        group by s.name
+        order by sum(s.notional_usd) desc
+        limit p_limit
+    ),
+    by_outcome as (
+        select s.name, s.outcome, sum(s.notional_usd) as c
+        from scoped s
+        join totals t on t.name = s.name
+        where s.outcome is not null
+        group by s.name, s.outcome
+    ),
+    dom as (
+        select name, outcome
+        from (
+            select name, outcome,
+                   row_number() over (partition by name order by c desc, outcome) as rn
+            from by_outcome
+        ) ranked
+        where rn = 1
+    )
+    select t.name, t.notional::double precision, t.unrealized::double precision,
+           t.wallets, d.outcome
+    from totals t
+    left join dom d on d.name = t.name
+    order by t.notional desc
+$$;
+
+-- Per-wallet book totals for an explicit address set (screener columns).
+create or replace function public.position_wallet_totals(p_addresses text[])
+returns table (
+    wallet_address text,
+    notional       double precision,
+    unrealized     double precision
+)
+language sql
+stable
+as $$
+    select p.wallet_address,
+           coalesce(sum(p.notional_usd), 0)::double precision,
+           coalesce(sum(p.unrealized_pnl), 0)::double precision
+    from public.positions p
+    where p.wallet_address = any(p_addresses)
+    group by p.wallet_address
+$$;
+
+-- The anon role is never granted: every page reaches these behind a session.
+grant execute on function public.alert_buckets(bigint, bigint, integer, text, text, text, text[]) to authenticated;
+grant execute on function public.alert_window_stats(bigint, bigint, text[], text) to authenticated;
+grant execute on function public.alert_top_entities(bigint, bigint, text, integer, text) to authenticated;
+grant execute on function public.alert_entity_series(bigint, bigint, integer, text, text[]) to authenticated;
+grant execute on function public.alert_wallet_counts(bigint, bigint, text[]) to authenticated;
+grant execute on function public.position_totals() to authenticated;
+grant execute on function public.position_top_markets(integer) to authenticated;
+grant execute on function public.position_wallet_totals(text[]) to authenticated;

@@ -2,14 +2,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
 import { useRange } from '../context/RangeProvider'
-import { bucketize } from '../lib/range'
+import type { Bucket } from '../lib/range'
 import {
   ALERT_TYPE_ORDER, alertColor, alertLabel, formatTs, isCoordinated, shortAddress, twapDuration,
   type AlertRow, type TwapPatternRow,
 } from '../lib/types'
+import { alertBuckets } from '../lib/aggregates'
 import { SERIES, STATUS } from '../lib/theme'
 import { ago, compact, duration } from '../lib/format'
 import FilterBar from '../components/FilterBar'
+import LoadError from '../components/LoadError'
 import Panel from '../components/viz/Panel'
 import ActivityChart from '../components/viz/ActivityChart'
 import Legend from '../components/viz/Legend'
@@ -40,7 +42,8 @@ export default function AlertExplorer() {
   const [params, setParams] = useSearchParams()
 
   const [rows, setRows] = useState<AlertRow[]>([])
-  const [hist, setHist] = useState<{ alert_type: string; timestamp_ms: number | null }[]>([])
+  const [buckets, setBuckets] = useState<Bucket[]>([])
+  const [error, setError] = useState<string | null>(null)
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(0)
   const [types, setTypes] = useState<Set<string>>(new Set())
@@ -79,28 +82,36 @@ export default function AlertExplorer() {
     let cancelled = false
     const load = async () => {
       setLoading(true)
-      const pageRes = await applyFilters(supabase.from('alerts').select('*', { count: 'exact' }))
-        .order('timestamp_ms', { ascending: false })
-        .range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1)
-      const histRes = await applyFilters(supabase.from('alerts').select('alert_type, timestamp_ms')).limit(HIST_CAP)
-      if (cancelled) return
-      setRows((pageRes.data as AlertRow[]) ?? [])
-      setTotal(pageRes.count ?? 0)
-      setHist((histRes.data as { alert_type: string; timestamp_ms: number | null }[]) ?? [])
-      setCursor(0)
-      setLoading(false)
+      try {
+        // The density chart is aggregated in Postgres over the WHOLE filtered
+        // slice. Sampling rows for it -- capped, and previously unordered --
+        // drew whichever fraction the cap happened to admit.
+        const [pageRes, bucketRes] = await Promise.all([
+          applyFilters(supabase.from('alerts').select('*', { count: 'exact' }))
+            .order('timestamp_ms', { ascending: false })
+            .range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1),
+          alertBuckets(def, start, end, { walletLike: wallet, market, types: [...types] }),
+        ])
+        if (cancelled) return
+        if (pageRes.error) throw new Error(pageRes.error.message)
+        setRows((pageRes.data as AlertRow[]) ?? [])
+        setTotal(pageRes.count ?? 0)
+        setBuckets(bucketRes)
+        setCursor(0)
+        setError(null)
+      } catch (e) {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e))
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
     }
     void load()
     return () => { cancelled = true }
-  }, [applyFilters, page, rangeKey, nonce])
+  }, [applyFilters, page, rangeKey, nonce, def, start, end, wallet, market, types])
 
   // Filters reset the page: staying on page 7 of a 2-page result shows nothing.
   useEffect(() => { setPage(0) }, [types, wallet, market, rangeKey])
 
-  const buckets = useMemo(
-    () => bucketize(hist, (r) => r.timestamp_ms, (r) => r.alert_type, def, start, end),
-    [hist, def, start, end],
-  )
   const pages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const legendItems = ALERT_TYPE_ORDER.map((t) => ({ key: t, label: alertLabel(t), color: alertColor(t) }))
 
@@ -189,6 +200,8 @@ export default function AlertExplorer() {
       </FilterBar>
 
       <div className="space-y-3">
+        {error && <LoadError message={error} />}
+
         <div className="flex flex-wrap items-center gap-1.5">
           <span className="font-mono text-[9px] uppercase tracking-wider text-slate-600">type</span>
           {ALERT_TYPE_ORDER.map((t) => {
@@ -216,7 +229,7 @@ export default function AlertExplorer() {
 
         <Panel
           title="Query density"
-          meta={`${def.label} · ${compact(hist.length)} matched${hist.length >= HIST_CAP ? ' (capped)' : ''}`}
+          meta={`${def.label} · ${compact(total)} matched`}
           loading={loading}
           table={{
             columns: ['Time', ...ALERT_TYPE_ORDER.map(alertLabel), 'Total'],

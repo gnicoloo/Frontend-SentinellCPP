@@ -49,41 +49,63 @@ export interface Bucket {
 }
 
 /**
- * Build a dense, gap-free bucket series -- empty buckets are emitted as zeros so
- * the x-axis stays linear in time and a quiet hour reads as quiet, not missing.
+ * Series are bucketed in Postgres (see the aggregates in schema_supabase.sql)
+ * and densified here. There is deliberately no "bucket these rows client-side"
+ * helper any more: counting a fetched page only ever described the slice the
+ * row cap admitted, which is what made long ranges collapse to a single day.
  *
  * The grid is anchored to the caller's exact [start, end] rather than to a
  * global clock grid: that is what makes a chart's total equal the KPI computed
  * over the same window. Snapping to round clock edges instead would push the
  * last column past `now` and silently drop up to one bucket of real history.
+ *
+ * How many buckets a window splits into. The aggregates take this as a
+ * parameter and index rows with the same formula, so a bucket built in Postgres
+ * and one built here always describe the same slice of time.
  */
-export function bucketize<T>(
-  items: T[],
-  getTime: (item: T) => number | null | undefined,
-  getSeries: (item: T) => string,
-  def: RangeDef,
+export function bucketCount(def: RangeDef, start: number, end: number): number {
+  return Math.max(1, Math.round((end - start) / def.bucket))
+}
+
+/** The empty grid every densifier fills. */
+function emptyBuckets(count: number, start: number, end: number): Bucket[] {
+  const width = (end - start) / count
+  const buckets: Bucket[] = []
+  for (let i = 0; i < count; i++) buckets.push({ t: start + i * width, total: 0 })
+  return buckets
+}
+
+/**
+ * Turn `(bucket_index, series, n)` rows from an aggregate into the dense,
+ * gap-free series the charts expect. Absent buckets stay zero, exactly as
+ * bucketize() would have emitted them from raw rows.
+ */
+export function densify(
+  rows: { bucket_index: number; key: string; n: number }[],
+  count: number,
   start: number,
   end: number,
 ): Bucket[] {
-  const count = Math.max(1, Math.round((end - start) / def.bucket))
-  const width = (end - start) / count
-
-  const buckets: Bucket[] = []
-  for (let i = 0; i < count; i++) buckets.push({ t: start + i * width, total: 0 })
-
-  for (const item of items) {
-    const ts = getTime(item)
-    if (!ts || ts < start || ts > end) continue
-    // The final bucket is closed on the right so an event landing exactly on
-    // `end` counts, instead of falling off the chart.
-    const idx = Math.min(count - 1, Math.floor((ts - start) / width))
-    const b = buckets[idx]
+  const buckets = emptyBuckets(count, start, end)
+  for (const r of rows) {
+    const b = buckets[r.bucket_index]
     if (!b) continue
-    const key = getSeries(item)
-    b[key] = (b[key] ?? 0) + 1
-    b.total += 1
+    b[r.key] = ((b[r.key] as number) ?? 0) + r.n
+    b.total += r.n
   }
   return buckets
+}
+
+/** The single-series form -- sparklines want plain numbers, not buckets. */
+export function densifySeries(
+  rows: { bucket_index: number; n: number }[],
+  count: number,
+): number[] {
+  const out = new Array<number>(count).fill(0)
+  for (const r of rows) {
+    if (r.bucket_index >= 0 && r.bucket_index < count) out[r.bucket_index] += r.n
+  }
+  return out
 }
 
 /** Window bounds for a range, plus the equal-length window before it. */

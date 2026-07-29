@@ -2,15 +2,21 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
 import { useRange } from '../context/RangeProvider'
-import { bucketize } from '../lib/range'
+import type { Bucket } from '../lib/range'
 import {
   ALERT_TYPE_ORDER, alertColor, alertLabel, outcomeColor, shortAddress,
-  type AlertRow, type AlertTradeRow, type PositionRow, type WalletRow,
+  type AlertTradeRow, type WalletRow,
 } from '../lib/types'
+import {
+  alertBuckets, alertEntitySeries, alertTopEntities, alertWindowStats,
+  positionTopMarkets, positionTotals,
+  type ExposureMarket, type PositionTotals, type TopEntity, type WindowStats,
+} from '../lib/aggregates'
 import { ACCENT, SERIES, STATUS } from '../lib/theme'
 import { ago, changeRatio, compact, percentileOf, usd } from '../lib/format'
 import FilterBar from '../components/FilterBar'
 import SyncStatus from '../components/SyncStatus'
+import LoadError from '../components/LoadError'
 import Panel from '../components/viz/Panel'
 import StatTile from '../components/viz/StatTile'
 import ActivityChart from '../components/viz/ActivityChart'
@@ -19,208 +25,165 @@ import Sparkline from '../components/viz/Sparkline'
 import MiniBar from '../components/viz/MiniBar'
 import Signed from '../components/viz/Signed'
 
-const ROW_CAP = 6000
+const SEVERE = ['suspect_trade', 'deception_alert']
 
-type FlowRow = Pick<AlertRow, 'alert_type' | 'wallet_address' | 'asset_id' | 'market_title' | 'timestamp_ms'>
+/** A busy feed must not turn every insert into a refetch of the aggregates. */
+const LIVE_THROTTLE_MS = 15_000
 
-const SEVERE = new Set(['suspect_trade', 'deception_alert'])
+const EMPTY_STATS: WindowStats = { total: 0, severe: 0, wallets: 0, markets: 0 }
+const EMPTY_BOOK: PositionTotals = { notional: 0, unrealized: 0, openLegs: 0, wallets: 0, tokens: 0 }
 
 export default function Dashboard() {
   const { def, key, nonce, start, end, prevStart } = useRange()
-  const [rows, setRows] = useState<FlowRow[]>([])
-  const [wallets, setWallets] = useState<WalletRow[]>([])
+
+  const [buckets, setBuckets] = useState<Bucket[]>([])
+  const [curr, setCurr] = useState<WindowStats>(EMPTY_STATS)
+  const [prev, setPrev] = useState<WindowStats>(EMPTY_STATS)
+  const [topMarkets, setTopMarkets] = useState<TopEntity[]>([])
+  const [marketSeries, setMarketSeries] = useState<Map<string, number[]>>(new Map())
+  const [topActors, setTopActors] = useState<TopEntity[]>([])
+  const [actorSeries, setActorSeries] = useState<Map<string, number[]>>(new Map())
+  const [actorWallets, setActorWallets] = useState<WalletRow[]>([])
+  const [infoPop, setInfoPop] = useState<number[]>([])
+  const [book, setBook] = useState<PositionTotals>(EMPTY_BOOK)
+  const [exposure, setExposure] = useState<ExposureMarket[]>([])
   const [tape, setTape] = useState<AlertTradeRow[]>([])
-  const [positions, setPositions] = useState<PositionRow[]>([])
   const [loading, setLoading] = useState(true)
-  const [truncated, setTruncated] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   const [hidden, setHidden] = useState<Set<string>>(new Set())
   const flashRef = useRef<Set<number>>(new Set())
+
+  // Live inserts nudge the aggregates, throttled -- the tape below is what
+  // actually streams; the histogram only needs to not drift for a minute.
+  const [liveNonce, setLiveNonce] = useState(0)
+  const lastLiveRef = useRef(0)
 
   useEffect(() => {
     let cancelled = false
     const load = async () => {
       setLoading(true)
-      // One pull covering the current window AND the prior one of equal length,
-      // so every delta on this page is computed off the same rows as the chart.
-      const [flowRes, walletRes, tapeRes, posRes] = await Promise.all([
-        supabase
-          .from('alerts')
-          .select('alert_type, wallet_address, asset_id, market_title, timestamp_ms')
-          .gte('timestamp_ms', prevStart)
-          .lte('timestamp_ms', end)
-          .order('timestamp_ms', { ascending: false })
-          .limit(ROW_CAP),
-        supabase.from('wallets').select('*').order('info_score', { ascending: false }).limit(500),
-        supabase.from('alert_trades').select('*').order('id', { ascending: false }).limit(20),
-        // The book is a live snapshot, so it is deliberately not time-scoped:
-        // "capital at risk right now" has no 24h version.
-        supabase.from('positions').select('*').order('notional_usd', { ascending: false }).limit(1000),
-      ])
-      if (cancelled) return
-      const flow = (flowRes.data as FlowRow[]) ?? []
-      setRows(flow)
-      setTruncated(flow.length >= ROW_CAP)
-      setWallets((walletRes.data as WalletRow[]) ?? [])
-      setTape((tapeRes.data as AlertTradeRow[]) ?? [])
-      setPositions((posRes.data as PositionRow[]) ?? [])
-      setLoading(false)
+      try {
+        // Everything below is aggregated in Postgres, so the payload is
+        // proportional to the bucket count, not to the size of `alerts`.
+        const [
+          bucketRes, currRes, prevRes, marketRes, actorRes, bookRes, exposureRes, tapeRes,
+        ] = await Promise.all([
+          alertBuckets(def, start, end),
+          alertWindowStats(start, end, SEVERE),
+          alertWindowStats(prevStart, start - 1, SEVERE),
+          alertTopEntities(start, end, 'market', 8),
+          alertTopEntities(start, end, 'wallet', 8),
+          positionTotals(),
+          positionTopMarkets(8),
+          supabase.from('alert_trades').select('*').order('id', { ascending: false }).limit(20),
+        ])
+        if (cancelled) return
+
+        const marketKeys = marketRes.map((m) => m.key)
+        const actorKeys = actorRes.map((a) => a.key)
+
+        // Shapes and wallet profiles only for the rows actually rendered.
+        const [mSeries, aSeries, walletRes, popRes] = await Promise.all([
+          alertEntitySeries(def, start, end, 'market', marketKeys),
+          alertEntitySeries(def, start, end, 'wallet', actorKeys),
+          actorKeys.length
+            ? supabase.from('wallets').select('*').in('address', actorKeys)
+            : Promise.resolve({ data: [] as WalletRow[] }),
+          supabase.from('wallets').select('info_score').order('info_score', { ascending: false }).limit(500),
+        ])
+        if (cancelled) return
+
+        setBuckets(bucketRes)
+        setCurr(currRes)
+        setPrev(prevRes)
+        setTopMarkets(marketRes)
+        setMarketSeries(mSeries)
+        setTopActors(actorRes)
+        setActorSeries(aSeries)
+        setActorWallets((walletRes.data as WalletRow[]) ?? [])
+        setInfoPop(
+          (((popRes.data as { info_score: number }[]) ?? []).map((w) => w.info_score)).sort((a, b) => a - b),
+        )
+        setBook(bookRes)
+        setExposure(exposureRes)
+        setTape((tapeRes.data as AlertTradeRow[]) ?? [])
+        setError(null)
+      } catch (e) {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e))
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
     }
     void load()
     return () => { cancelled = true }
-  }, [key, nonce, prevStart, end])
+  }, [key, nonce, liveNonce, def, start, end, prevStart])
 
   // Live tape: new inserts land at the top and flash once.
   useEffect(() => {
     const channel = supabase
       .channel('dashboard-feed')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'alerts' }, (payload) => {
-        const row = payload.new as AlertRow
-        setRows((prev) => [{
-          alert_type: row.alert_type,
-          wallet_address: row.wallet_address,
-          asset_id: row.asset_id,
-          market_title: row.market_title,
-          timestamp_ms: row.timestamp_ms,
-        }, ...prev])
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'alerts' }, () => {
+        const now = Date.now()
+        if (now - lastLiveRef.current < LIVE_THROTTLE_MS) return
+        lastLiveRef.current = now
+        setLiveNonce((n) => n + 1)
       })
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'alert_trades' }, (payload) => {
         const row = payload.new as AlertTradeRow
         flashRef.current.add(row.id)
-        setTape((prev) => [row, ...prev].slice(0, 20))
+        setTape((prevTape) => [row, ...prevTape].slice(0, 20))
       })
       .subscribe()
     return () => { void supabase.removeChannel(channel) }
   }, [])
 
-  const current = useMemo(
-    () => rows.filter((r) => r.timestamp_ms !== null && r.timestamp_ms >= start && r.timestamp_ms <= end),
-    [rows, start, end],
-  )
-  const previous = useMemo(
-    () => rows.filter((r) => r.timestamp_ms !== null && r.timestamp_ms >= prevStart && r.timestamp_ms < start),
-    [rows, prevStart, start],
-  )
-
-  const buckets = useMemo(
-    () => bucketize(current, (r) => r.timestamp_ms, (r) => r.alert_type, def, start, end),
-    [current, def, start, end],
-  )
-
-  const kpis = useMemo(() => {
-    const distinct = (list: FlowRow[], pick: (r: FlowRow) => string | null) =>
-      new Set(list.map(pick).filter((v): v is string => !!v)).size
-    const severe = (list: FlowRow[]) => list.filter((r) => SEVERE.has(r.alert_type)).length
-    const marketKey = (r: FlowRow) => r.market_title ?? r.asset_id
-    return {
-      flow: [current.length, previous.length],
-      severe: [severe(current), severe(previous)],
-      actors: [distinct(current, (r) => r.wallet_address), distinct(previous, (r) => r.wallet_address)],
-      markets: [distinct(current, marketKey), distinct(previous, marketKey)],
-      peak: Math.max(0, ...buckets.map((b) => b.total)),
-    }
-  }, [current, previous, buckets])
-
   const totalTrend = useMemo(() => buckets.map((b) => b.total), [buckets])
   const severeTrend = useMemo(
-    () => buckets.map((b) => [...SEVERE].reduce((s, t) => s + ((b[t] as number) ?? 0), 0)),
+    () => buckets.map((b) => SEVERE.reduce((s, t) => s + ((b[t] as number) ?? 0), 0)),
     [buckets],
   )
+  const peak = useMemo(() => Math.max(0, ...buckets.map((b) => b.total)), [buckets])
 
-  // Market heat: which books are absorbing the flow, and what kind of flow.
   const markets = useMemo(() => {
-    const map = new Map<string, { name: string; total: number; types: Map<string, number>; wallets: Set<string>; series: number[] }>()
-    for (const r of current) {
-      const name = r.market_title ?? r.asset_id
-      if (!name) continue
-      if (!map.has(name)) map.set(name, { name, total: 0, types: new Map(), wallets: new Set(), series: [] })
-      const m = map.get(name)!
-      m.total += 1
-      m.types.set(r.alert_type, (m.types.get(r.alert_type) ?? 0) + 1)
-      if (r.wallet_address) m.wallets.add(r.wallet_address)
-    }
-    const top = [...map.values()].sort((a, b) => b.total - a.total).slice(0, 8)
-    for (const m of top) {
-      const rowsOfMarket = current.filter((r) => (r.market_title ?? r.asset_id) === m.name)
-      m.series = bucketize(rowsOfMarket, (r) => r.timestamp_ms, () => 'v', def, start, end).map((b) => b.total)
-    }
-    const max = top[0]?.total ?? 1
-    return top.map((m) => {
-      const dominant = [...m.types.entries()].sort((a, b) => b[1] - a[1])[0]
-      return { ...m, share: m.total / max, dominant: dominant?.[0] ?? '', wallets: m.wallets.size }
-    })
-  }, [current, def, start, end])
+    const max = topMarkets[0]?.total ?? 1
+    return topMarkets.map((m) => ({
+      name: m.key,
+      total: m.total,
+      wallets: m.wallets,
+      dominant: m.dominant ?? '',
+      share: m.total / max,
+      series: marketSeries.get(m.key) ?? [],
+    }))
+  }, [topMarkets, marketSeries])
 
-  // Top actors: ranked by alert flow in the window, not by a static score.
   const actors = useMemo(() => {
-    const byWallet = new Map<string, number>()
-    for (const r of current) {
-      if (!r.wallet_address) continue
-      byWallet.set(r.wallet_address, (byWallet.get(r.wallet_address) ?? 0) + 1)
-    }
-    const infoPop = [...wallets].map((w) => w.info_score).sort((a, b) => a - b)
-    const walletById = new Map(wallets.map((w) => [w.address, w]))
-    const top = [...byWallet.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8)
-    const max = top[0]?.[1] ?? 1
-    return top.map(([address, count]) => {
-      const w = walletById.get(address)
-      const series = bucketize(
-        current.filter((r) => r.wallet_address === address), (r) => r.timestamp_ms, () => 'v', def, start, end,
-      ).map((b) => b.total)
+    const byAddress = new Map(actorWallets.map((w) => [w.address, w]))
+    const max = topActors[0]?.total ?? 1
+    return topActors.map((a) => {
+      const w = byAddress.get(a.key)
       return {
-        address,
-        count,
-        share: count / max,
+        address: a.key,
+        count: a.total,
+        share: a.total / max,
         info: w?.info_score ?? null,
         pctl: w ? percentileOf(w.info_score, infoPop) : null,
         volume: w?.total_volume ?? null,
         label: w?.label ?? null,
-        series,
+        series: actorSeries.get(a.key) ?? [],
       }
     })
-  }, [current, wallets, def, start, end])
-
-  // Capital at risk, by market. Alert flow says where the noise is; this says
-  // where the money is -- the two do not always point at the same book.
-  const exposure = useMemo(() => {
-    const byMarket = new Map<string, {
-      name: string; notional: number; unrealized: number
-      wallets: Set<string>; outcomes: Map<string, number>
-    }>()
-    for (const p of positions) {
-      const name = p.market_title ?? p.asset_id
-      if (!byMarket.has(name)) {
-        byMarket.set(name, { name, notional: 0, unrealized: 0, wallets: new Set(), outcomes: new Map() })
-      }
-      const m = byMarket.get(name)!
-      m.notional += p.notional_usd
-      m.unrealized += p.unrealized_pnl
-      m.wallets.add(p.wallet_address)
-      if (p.outcome) m.outcomes.set(p.outcome, (m.outcomes.get(p.outcome) ?? 0) + p.notional_usd)
-    }
-    const top = [...byMarket.values()].sort((a, b) => b.notional - a.notional).slice(0, 8)
-    const max = top[0]?.notional ?? 1
-    return {
-      top: top.map((m) => ({
-        ...m,
-        share: m.notional / max,
-        wallets: m.wallets.size,
-        dominant: [...m.outcomes.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null,
-      })),
-      totalNotional: positions.reduce((s, p) => s + p.notional_usd, 0),
-      totalUnrealized: positions.reduce((s, p) => s + p.unrealized_pnl, 0),
-      openLegs: positions.filter((p) => p.net_contracts !== 0).length,
-      wallets: new Set(positions.map((p) => p.wallet_address)).size,
-    }
-  }, [positions])
+  }, [topActors, actorWallets, actorSeries, infoPop])
 
   const legendItems = ALERT_TYPE_ORDER.map((t) => ({ key: t, label: alertLabel(t), color: alertColor(t) }))
   const toggle = (k: string) =>
-    setHidden((prev) => {
-      const next = new Set(prev)
+    setHidden((prevHidden) => {
+      const next = new Set(prevHidden)
       if (next.has(k)) next.delete(k)
       else next.add(k)
       return next
     })
+
+  const maxExposure = exposure[0]?.notional ?? 1
 
   return (
     <div>
@@ -230,35 +193,31 @@ export default function Dashboard() {
       />
 
       <div className="space-y-3">
-        {truncated && (
-          <p className="border-l-2 px-3 py-1.5 text-[10px] font-mono uppercase text-slate-400" style={{ borderColor: STATUS.warning }}>
-            ⚠ row cap reached ({compact(ROW_CAP)}) — narrow the range for exact figures
-          </p>
-        )}
+        {error && <LoadError message={error} />}
 
         <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-5">
           <StatTile
-            label="Alert flow" accent={SERIES[0]} value={compact(kpis.flow[0])}
-            delta={changeRatio(kpis.flow[0], kpis.flow[1])} inverted
+            label="Alert flow" accent={SERIES[0]} value={compact(curr.total)}
+            delta={changeRatio(curr.total, prev.total)} inverted
             trend={totalTrend} footnote={`vs prior ${def.label}`}
           />
           <StatTile
-            label="Severe flow" accent={SERIES[1]} value={compact(kpis.severe[0])}
-            delta={changeRatio(kpis.severe[0], kpis.severe[1])} inverted
+            label="Severe flow" accent={SERIES[1]} value={compact(curr.severe)}
+            delta={changeRatio(curr.severe, prev.severe)} inverted
             trend={severeTrend} footnote="suspect + deception"
           />
           <StatTile
-            label="Active wallets" accent={SERIES[2]} value={compact(kpis.actors[0])}
-            delta={changeRatio(kpis.actors[0], kpis.actors[1])}
+            label="Active wallets" accent={SERIES[2]} value={compact(curr.wallets)}
+            delta={changeRatio(curr.wallets, prev.wallets)}
             footnote={`vs prior ${def.label}`}
           />
           <StatTile
-            label="Markets touched" accent={SERIES[3]} value={compact(kpis.markets[0])}
-            delta={changeRatio(kpis.markets[0], kpis.markets[1])}
+            label="Markets touched" accent={SERIES[3]} value={compact(curr.markets)}
+            delta={changeRatio(curr.markets, prev.markets)}
             footnote={`vs prior ${def.label}`}
           />
           <StatTile
-            label="Peak intensity" accent={SERIES[5]} value={compact(kpis.peak)}
+            label="Peak intensity" accent={SERIES[5]} value={compact(peak)}
             footnote={`max alerts / ${def.label === '30D' ? 'day' : 'bucket'}`}
           />
         </div>
@@ -267,19 +226,19 @@ export default function Dashboard() {
             tiles deliberately show no "vs prior" the way the flow tiles do. */}
         <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
           <StatTile
-            label="Capital at risk" accent={SERIES[4]} value={usd(exposure.totalNotional)}
-            footnote={`${compact(exposure.openLegs)} open legs · live`}
+            label="Capital at risk" accent={SERIES[4]} value={usd(book.notional)}
+            footnote={`${compact(book.openLegs)} open legs · live`}
           />
           <StatTile
-            label="Unrealized P&L" accent={SERIES[1]} value={usd(exposure.totalUnrealized)}
-            footnote={exposure.totalUnrealized >= 0 ? '▲ book in profit' : '▼ book in loss'}
+            label="Unrealized P&L" accent={SERIES[1]} value={usd(book.unrealized)}
+            footnote={book.unrealized >= 0 ? '▲ book in profit' : '▼ book in loss'}
           />
           <StatTile
-            label="Wallets with a book" accent={SERIES[2]} value={compact(exposure.wallets)}
+            label="Wallets with a book" accent={SERIES[2]} value={compact(book.wallets)}
             footnote="holding open exposure"
           />
           <StatTile
-            label="Books at risk" accent={SERIES[3]} value={compact(exposure.top.length ? new Set(positions.map((p) => p.condition_id ?? p.asset_id)).size : 0)}
+            label="Books at risk" accent={SERIES[3]} value={compact(book.tokens)}
             footnote="distinct outcome tokens"
           />
         </div>
@@ -288,7 +247,7 @@ export default function Dashboard() {
           <Panel
             className="xl:col-span-2"
             title="Alert flow by type"
-            meta={`${def.label} · ${compact(current.length)} events`}
+            meta={`${def.label} · ${compact(curr.total)} events`}
             loading={loading}
             table={{
               columns: ['Time', ...ALERT_TYPE_ORDER.map(alertLabel), 'Total'],
@@ -359,22 +318,22 @@ export default function Dashboard() {
         <div className="grid gap-3 xl:grid-cols-3">
           <Panel
             title="Capital at risk"
-            meta={`top ${exposure.top.length} books · live`}
+            meta={`top ${exposure.length} books · live`}
             loading={loading}
             table={{
               columns: ['Market', 'Notional', 'Unrealized', 'Wallets', 'Dominant side'],
-              rows: exposure.top.map((m) => [
+              rows: exposure.map((m) => [
                 m.name, m.notional.toFixed(2), m.unrealized.toFixed(2), m.wallets, m.dominant ?? '—',
               ]),
             }}
           >
             <ul className="divide-y divide-sentinel-border/40">
-              {exposure.top.length === 0 && (
+              {exposure.length === 0 && (
                 <li className="px-3 py-4 font-mono text-[10px] uppercase text-slate-600">
                   no exposure synced
                 </li>
               )}
-              {exposure.top.map((m) => (
+              {exposure.map((m) => (
                 <li key={m.name} className="px-3 py-1.5">
                   <div className="flex items-baseline gap-2">
                     <span
@@ -392,7 +351,7 @@ export default function Dashboard() {
                     <span className="num shrink-0 text-[11px] font-semibold text-slate-100">{usd(m.notional)}</span>
                   </div>
                   <div className="mt-1 flex items-center gap-2 pl-4">
-                    <MiniBar value={m.share} color={outcomeColor(m.dominant)} width={72} />
+                    <MiniBar value={m.notional / maxExposure} color={outcomeColor(m.dominant)} width={72} />
                     <Signed className="num text-[10px]" value={m.unrealized} format={usd} />
                     <span className="ml-auto font-mono text-[9px] uppercase text-slate-600">
                       {m.wallets} wlt · {m.dominant ?? 'n/a'}

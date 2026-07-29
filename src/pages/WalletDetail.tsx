@@ -5,15 +5,20 @@ import {
 } from 'recharts'
 import { supabase } from '../lib/supabaseClient'
 import { useRange } from '../context/RangeProvider'
-import { bucketize } from '../lib/range'
+import type { Bucket } from '../lib/range'
 import {
   ALERT_TYPE_ORDER, alertColor, alertLabel, formatTs, isCoordinated, shortAddress, twapDuration,
   type AlertRow, type PositionRow, type TwapPatternRow, type WalletRow,
 } from '../lib/types'
+import {
+  LIFETIME, alertBuckets, alertTopEntities, alertWindowStats,
+  type TopEntity, type WindowStats,
+} from '../lib/aggregates'
 import { INK, SERIES, STATUS, severityOf } from '../lib/theme'
 import { ago, compact, ordinal, percentileOf, pct, usd } from '../lib/format'
 import { median } from '../lib/stats'
 import FilterBar from '../components/FilterBar'
+import LoadError from '../components/LoadError'
 import Panel from '../components/viz/Panel'
 import StatTile from '../components/viz/StatTile'
 import ScoreMeter from '../components/viz/ScoreMeter'
@@ -69,6 +74,10 @@ export default function WalletDetail() {
   const [positions, setPositions] = useState<PositionRow[]>([])
   const [twaps, setTwaps] = useState<TwapPatternRow[]>([])
   const [deception, setDeception] = useState<DeceptionRow | null>(null)
+  const [buckets, setBuckets] = useState<Bucket[]>([])
+  const [topBooks, setTopBooks] = useState<TopEntity[]>([])
+  const [lifetime, setLifetime] = useState<WindowStats>({ total: 0, severe: 0, wallets: 0, markets: 0 })
+  const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [notFound, setNotFound] = useState(false)
   const [hidden, setHidden] = useState<Set<string>>(new Set())
@@ -78,7 +87,11 @@ export default function WalletDetail() {
     let cancelled = false
     const load = async () => {
       setLoading(true)
-      const [walletRes, peerRes, alertRes, moveRes, decRes, posRes, twapRes] = await Promise.all([
+      try {
+      const [
+        walletRes, peerRes, alertRes, moveRes, decRes, posRes, twapRes,
+        bucketRes, bookRes, countRes,
+      ] = await Promise.all([
         supabase.from('wallets').select('*').eq('address', addr).maybeSingle(),
         supabase.from('wallets').select('*').order('info_score', { ascending: false }).limit(500),
         supabase.from('alerts').select('*').eq('wallet_address', addr).order('timestamp_ms', { ascending: false }).limit(500),
@@ -104,6 +117,12 @@ export default function WalletDetail() {
           .contains('wallets', JSON.stringify([addr]))
           .order('end_time', { ascending: false })
           .limit(50),
+        // The timeline and the book ranking are aggregated in Postgres: the
+        // `alerts` fetch above is a capped LOG, and bucketing it would draw
+        // only as much history as the cap happened to admit.
+        alertBuckets(def, start, end, { wallet: addr }),
+        alertTopEntities(LIFETIME.start, LIFETIME.end, 'market', 8, addr),
+        alertWindowStats(LIFETIME.start, LIFETIME.end, [], addr),
       ])
       if (cancelled) return
       setWallet((walletRes.data as WalletRow) ?? null)
@@ -113,22 +132,23 @@ export default function WalletDetail() {
       setMoves((moveRes.data as SuspectMove[]) ?? [])
       setPositions((posRes.data as PositionRow[]) ?? [])
       setTwaps((twapRes.data as TwapPatternRow[]) ?? [])
+      setBuckets(bucketRes)
+      setTopBooks(bookRes)
+      setLifetime(countRes)
       const d = decRes.data as DeceptionRow[] | null
       setDeception(d && d.length > 0 ? d[0] : null)
-      setLoading(false)
+      setError(null)
+      } catch (e) {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e))
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
     }
     void load()
     return () => { cancelled = true }
-  }, [addr, rangeKey, nonce])
+  }, [addr, rangeKey, nonce, def, start, end])
 
-  const windowAlerts = useMemo(
-    () => alerts.filter((a) => a.timestamp_ms !== null && a.timestamp_ms >= start && a.timestamp_ms <= end),
-    [alerts, start, end],
-  )
-  const buckets = useMemo(
-    () => bucketize(windowAlerts, (a) => a.timestamp_ms, (a) => a.alert_type, def, start, end),
-    [windowAlerts, def, start, end],
-  )
+  const windowFlow = useMemo(() => buckets.reduce((s, b) => s + b.total, 0), [buckets])
 
   // Peer population -- every score on this page is shown against it.
   const pop = useMemo(() => {
@@ -171,21 +191,17 @@ export default function WalletDetail() {
   const threat = wallet ? Math.min(1, wallet.suspicious_score / 10) : 0
   const sev = severityOf(threat)
 
-  // Which books this wallet actually shows up in.
+  // Which books this wallet actually shows up in, ranked over its whole
+  // history by Postgres -- the `alerts` fetch above is a capped log.
   const exposure = useMemo(() => {
-    const map = new Map<string, { name: string; count: number; types: Set<string> }>()
-    for (const a of alerts) {
-      const name = a.market_title ?? a.asset_id
-      if (!name) continue
-      if (!map.has(name)) map.set(name, { name, count: 0, types: new Set() })
-      const m = map.get(name)!
-      m.count += 1
-      m.types.add(a.alert_type)
-    }
-    const list = [...map.values()].sort((a, b) => b.count - a.count).slice(0, 8)
-    const max = list[0]?.count ?? 1
-    return list.map((m) => ({ ...m, share: m.count / max, types: [...m.types] }))
-  }, [alerts])
+    const max = topBooks[0]?.total ?? 1
+    return topBooks.map((m) => ({
+      name: m.key,
+      count: m.total,
+      types: m.types ?? [],
+      share: m.total / max,
+    }))
+  }, [topBooks])
 
   // The live book: what this wallet actually holds right now, not what it was
   // flagged for. `positions` carries one row per (wallet, outcome token).
@@ -277,6 +293,8 @@ export default function WalletDetail() {
           )}
         </div>
 
+        {error && <LoadError message={error} />}
+
         {notFound && (
           <p className="border-l-2 px-3 py-1.5 font-mono text-[10px] uppercase text-slate-400" style={{ borderColor: STATUS.warning }}>
             ⚠ wallet not in registry — showing related alerts only
@@ -302,11 +320,11 @@ export default function WalletDetail() {
               footnote={wallet.total_profit >= 0 ? '▲ in profit' : '▼ in loss'}
             />
             <StatTile
-              label={`Flow ${def.label}`} accent={SERIES[5]} value={compact(windowAlerts.length)}
-              trend={buckets.map((b) => b.total)} footnote={`${compact(alerts.length)} lifetime`}
+              label={`Flow ${def.label}`} accent={SERIES[5]} value={compact(windowFlow)}
+              trend={buckets.map((b) => b.total)} footnote={`${compact(lifetime.total)} lifetime`}
             />
             <StatTile
-              label="Markets" accent={SERIES[4]} value={compact(exposure.length)}
+              label="Markets" accent={SERIES[4]} value={compact(lifetime.markets)}
               footnote="distinct books flagged"
             />
           </div>
@@ -385,7 +403,7 @@ export default function WalletDetail() {
           <Panel
             className="xl:col-span-2"
             title="Alert timeline"
-            meta={`${def.label} · ${compact(windowAlerts.length)} events`}
+            meta={`${def.label} · ${compact(windowFlow)} events`}
             loading={loading}
             table={{
               columns: ['Time', ...ALERT_TYPE_ORDER.map(alertLabel), 'Total'],
@@ -660,7 +678,7 @@ export default function WalletDetail() {
 
         <Panel
           title="Alert log"
-          meta={`${compact(alerts.length)} records · lifetime`}
+          meta={`${compact(alerts.length)} of ${compact(lifetime.total)} records · newest first`}
           loading={loading}
           actions={
             <Link to="/clusters" className="font-mono text-[9px] uppercase tracking-wider text-slate-500 hover:text-sentinel-accent">

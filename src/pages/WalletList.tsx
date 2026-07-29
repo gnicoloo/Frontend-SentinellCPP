@@ -2,12 +2,13 @@ import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
 import { useRange } from '../context/RangeProvider'
-import { bucketize } from '../lib/range'
-import { shortAddress, type PositionRow, type WalletRow } from '../lib/types'
+import { shortAddress, type WalletRow } from '../lib/types'
+import { alertEntitySeries, alertWalletCounts, positionWalletTotals } from '../lib/aggregates'
 import { SERIES, STATUS } from '../lib/theme'
 import { compact, percentileOf, pct, usd } from '../lib/format'
 import { quantile } from '../lib/stats'
 import FilterBar from '../components/FilterBar'
+import LoadError from '../components/LoadError'
 import Panel from '../components/viz/Panel'
 import Histogram from '../components/viz/Histogram'
 import MiniBar from '../components/viz/MiniBar'
@@ -37,7 +38,6 @@ interface Column {
 
 interface Screened extends WalletRow {
   flow: number
-  series: number[]
   win_rate: number
   info_pctl: number
   /** Live capital at risk, summed from `positions`. */
@@ -59,22 +59,24 @@ const COLUMNS: Column[] = [
   { key: 'total_profit', label: 'P&L', format: (w) => usd(w.total_profit), hideOnMobile: true, abs: usd },
 ]
 
-const ROW_CAP = 6000
 const PAGE_SIZE_OPTIONS = [50, 100, 250, 500] as const
 
-type PositionSlice = Pick<PositionRow, 'wallet_address' | 'notional_usd' | 'unrealized_pnl'>
+/** The registry slice the screener ranks. */
+const REGISTRY_CAP = 500
 
 export default function WalletList() {
   const { def, key: rangeKey, nonce, start, end } = useRange()
   const [wallets, setWallets] = useState<WalletRow[]>([])
-  const [flowRows, setFlowRows] = useState<{ wallet_address: string | null; timestamp_ms: number | null }[]>([])
-  const [positions, setPositions] = useState<PositionSlice[]>([])
+  const [flowCounts, setFlowCounts] = useState<Map<string, number>>(new Map())
+  const [bookTotals, setBookTotals] = useState<Map<string, { notional: number; unrealized: number }>>(new Map())
+  const [seriesMap, setSeriesMap] = useState<Map<string, number[]>>(new Map())
   const [search, setSearch] = useState('')
   const [sortKey, setSortKey] = useState<SortKey>('info_score')
   const [desc, setDesc] = useState(true)
   const [labeledOnly, setLabeledOnly] = useState(false)
   const [activeOnly, setActiveOnly] = useState(false)
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [pageSize, setPageSize] = useState<number>(PAGE_SIZE_OPTIONS[0])
   const [pageRaw, setPage] = useState(0)
 
@@ -82,58 +84,52 @@ export default function WalletList() {
     let cancelled = false
     const load = async () => {
       setLoading(true)
-      const [walletRes, flowRes, posRes] = await Promise.all([
-        supabase.from('wallets').select('*').order('info_score', { ascending: false }).limit(500),
-        supabase
-          .from('alerts')
-          .select('wallet_address, timestamp_ms')
-          .not('wallet_address', 'is', null)
-          .gte('timestamp_ms', start)
-          .lte('timestamp_ms', end)
-          .limit(ROW_CAP),
-        // Exposure is a live snapshot, not a windowed series: no time filter.
-        supabase.from('positions').select('wallet_address, notional_usd, unrealized_pnl').limit(ROW_CAP),
-      ])
-      if (cancelled) return
-      setWallets((walletRes.data as WalletRow[]) ?? [])
-      setFlowRows((flowRes.data as { wallet_address: string | null; timestamp_ms: number | null }[]) ?? [])
-      setPositions((posRes.data as PositionSlice[]) ?? [])
-      setLoading(false)
+      try {
+        const walletRes = await supabase
+          .from('wallets').select('*')
+          .order('info_score', { ascending: false })
+          .limit(REGISTRY_CAP)
+        if (cancelled) return
+        if (walletRes.error) throw new Error(walletRes.error.message)
+        const rows = (walletRes.data as WalletRow[]) ?? []
+        const addresses = rows.map((w) => w.address)
+
+        // Flow and exposure are summed in Postgres for exactly these addresses.
+        // Pulling raw alert/position rows and grouping them here meant the
+        // derived columns only ever reflected whatever the row cap admitted.
+        const [counts, book] = await Promise.all([
+          alertWalletCounts(start, end, addresses),
+          positionWalletTotals(addresses),
+        ])
+        if (cancelled) return
+        setWallets(rows)
+        setFlowCounts(counts)
+        setBookTotals(book)
+        setError(null)
+      } catch (e) {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e))
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
     }
     void load()
     return () => { cancelled = true }
   }, [rangeKey, nonce, start, end])
 
   const screened = useMemo<Screened[]>(() => {
-    const byWallet = new Map<string, { wallet_address: string | null; timestamp_ms: number | null }[]>()
-    for (const r of flowRows) {
-      if (!r.wallet_address) continue
-      const list = byWallet.get(r.wallet_address)
-      if (list) list.push(r)
-      else byWallet.set(r.wallet_address, [r])
-    }
-    const book = new Map<string, { notional: number; unrealized: number }>()
-    for (const p of positions) {
-      const acc = book.get(p.wallet_address) ?? { notional: 0, unrealized: 0 }
-      acc.notional += p.notional_usd
-      acc.unrealized += p.unrealized_pnl
-      book.set(p.wallet_address, acc)
-    }
     const infoPop = wallets.map((w) => w.info_score).sort((a, b) => a - b)
     return wallets.map((w) => {
-      const events = byWallet.get(w.address) ?? []
-      const exposure = book.get(w.address)
+      const exposure = bookTotals.get(w.address)
       return {
         ...w,
-        flow: events.length,
-        series: bucketize(events, (r) => r.timestamp_ms, () => 'v', def, start, end).map((b) => b.total),
+        flow: flowCounts.get(w.address) ?? 0,
         win_rate: w.trades_count > 0 ? w.win_count / w.trades_count : 0,
         info_pctl: percentileOf(w.info_score, infoPop),
         notional: exposure?.notional ?? 0,
         unrealized: exposure?.unrealized ?? 0,
       }
     })
-  }, [wallets, flowRows, positions, def, start, end])
+  }, [wallets, flowCounts, bookTotals])
 
   const filtered = useMemo(() => {
     const needle = search.trim().toLowerCase()
@@ -158,6 +154,23 @@ export default function WalletList() {
   )
 
   useEffect(() => { setPage(0) }, [search, labeledOnly, activeOnly, sortKey, desc, pageSize])
+
+  // Shapes load for the rendered page only, so the payload stays flat as the
+  // registry grows. Joined into a string so the effect keys on the addresses
+  // themselves rather than on a fresh array identity every render.
+  const visibleKey = visible.map((w) => w.address).join(',')
+  useEffect(() => {
+    let cancelled = false
+    const addresses = visibleKey ? visibleKey.split(',') : []
+    if (addresses.length === 0) {
+      setSeriesMap(new Map())
+      return
+    }
+    void alertEntitySeries(def, start, end, 'wallet', addresses)
+      .then((m) => { if (!cancelled) setSeriesMap(m) })
+      .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : String(e)) })
+    return () => { cancelled = true }
+  }, [visibleKey, def, start, end])
 
   const sortCol = COLUMNS.find((c) => c.key === sortKey)!
   const barMax = useMemo(() => {
@@ -188,6 +201,8 @@ export default function WalletList() {
       </FilterBar>
 
       <div className="space-y-3">
+        {error && <LoadError message={error} />}
+
         <Panel
           title={`Distribution · ${sortCol.label}`}
           meta={`n=${filtered.length} · sorted ${desc ? 'desc' : 'asc'}`}
@@ -289,7 +304,7 @@ export default function WalletList() {
                       <span className="ml-2 font-mono text-[9px] text-slate-600">p{Math.round(w.info_pctl * 100)}</span>
                     </td>
                     <td className="px-3 py-1">
-                      <Sparkline values={w.series} color={SERIES[0]} width={64} height={14} label={`${w.address} flow`} />
+                      <Sparkline values={seriesMap.get(w.address) ?? []} color={SERIES[0]} width={64} height={14} label={`${w.address} flow`} />
                     </td>
                     {COLUMNS.map((c) => {
                       const raw = Number(w[c.key])
