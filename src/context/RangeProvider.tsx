@@ -31,7 +31,12 @@ export function RangeProvider({ children }: { children: ReactNode }) {
   // charts freeze while the tape keeps moving. Panels hold their previous
   // render at reduced opacity across the refetch, so nothing flashes.
   useEffect(() => {
-    const id = setInterval(() => setNonce((n) => n + 1), AUTO_REFRESH_MS)
+    // A backgrounded tab still runs timers, so without this guard every tab
+    // left open (very easy to do in dev) keeps re-fetching every page's full
+    // query bundle once a minute, forever, even while nobody is looking at it.
+    const id = setInterval(() => {
+      if (document.visibilityState === 'visible') setNonce((n) => n + 1)
+    }, AUTO_REFRESH_MS)
     return () => clearInterval(id)
   }, [])
 

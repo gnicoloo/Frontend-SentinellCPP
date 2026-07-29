@@ -61,6 +61,17 @@ interface DeceptionRow {
   asymmetry_score: number | null
 }
 
+/**
+ * Exactly the columns the peer population reads (scores + `profile`, for the
+ * radar's peer median) -- see the `peers` query below. Dropping the rest
+ * (label, trades_count, win_count, total_profit, first/last_seen_ms,
+ * updated_at) matters because this 500-row fetch re-runs every 60s while the
+ * page is open.
+ */
+type PeerWallet = Pick<WalletRow,
+  | 'address' | 'info_score' | 'suspicious_score' | 'forensic_score'
+  | 'roi_estimate' | 'total_volume' | 'profile'>
+
 /** Popolazione di riferimento per i percentili di pagina. */
 const PEER_CAP = 500
 /** Il log alert è una lista, non un aggregato: resta capped e lo dichiara. */
@@ -85,7 +96,12 @@ export default function WalletDetail() {
       buckets, topBooks, lifetime,
     ] = await Promise.all([
       unwrap<WalletRow | null>(supabase.from('wallets').select('*').eq('address', addr).maybeSingle()),
-      unwrap<WalletRow[]>(supabase.from('wallets').select('*').order('info_score', { ascending: false }).limit(PEER_CAP)),
+      unwrap<PeerWallet[]>(
+        supabase.from('wallets')
+          .select('address, info_score, suspicious_score, forensic_score, roi_estimate, total_volume, profile')
+          .order('info_score', { ascending: false })
+          .limit(PEER_CAP),
+      ),
       unwrap<AlertRow[]>(supabase.from('alerts').select('*').eq('wallet_address', addr).order('timestamp_ms', { ascending: false }).limit(ALERT_LOG_CAP)),
       unwrap<SuspectMove[]>(supabase.from('suspect_moves').select('*').eq('wallet_address', addr).order('timestamp_ms', { ascending: false }).limit(100)),
       unwrap<DeceptionRow[]>(
@@ -154,7 +170,7 @@ export default function WalletDetail() {
 
   // Peer population -- every score on this page is shown against it.
   const pop = useMemo(() => {
-    const asc = (pick: (w: WalletRow) => number) => peers.map(pick).sort((a, b) => a - b)
+    const asc = (pick: (w: PeerWallet) => number) => peers.map(pick).sort((a, b) => a - b)
     return {
       info: asc((w) => w.info_score),
       susp: asc((w) => w.suspicious_score),

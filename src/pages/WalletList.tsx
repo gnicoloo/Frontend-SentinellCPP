@@ -38,7 +38,12 @@ interface Column {
   abs?: (v: number) => string
 }
 
-interface Screened extends WalletRow {
+/** Exactly the columns the screener selects -- see the `wallets` query below. */
+type ScreenerWallet = Pick<WalletRow,
+  | 'address' | 'label' | 'suspicious_score' | 'info_score' | 'forensic_score'
+  | 'roi_estimate' | 'trades_count' | 'win_count' | 'total_volume' | 'total_profit'>
+
+interface Screened extends ScreenerWallet {
   flow: number
   win_rate: number
   info_pctl: number
@@ -80,8 +85,12 @@ export default function WalletList() {
 
   const query = useSupabaseQuery(async () => {
     const [rows, registry] = await Promise.all([
-      unwrap<WalletRow[]>(
-        supabase.from('wallets').select('*')
+      unwrap<ScreenerWallet[]>(
+        // No column in COLUMNS/Screened reads `profile` (the full serialized
+        // profile jsonb) -- pulling it for 500 rows, on a page that re-fetches
+        // every 60s while open, was the single largest source of egress here.
+        supabase.from('wallets')
+          .select('address, label, suspicious_score, info_score, forensic_score, roi_estimate, trades_count, win_count, total_volume, total_profit')
           .order('info_score', { ascending: false })
           .limit(REGISTRY_CAP),
       ),

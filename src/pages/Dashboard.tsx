@@ -34,6 +34,9 @@ const LIVE_THROTTLE_MS = 15_000
 const EMPTY_STATS: WindowStats = { total: 0, severe: 0, wallets: 0, markets: 0 }
 const EMPTY_BOOK: PositionTotals = { notional: 0, unrealized: 0, openLegs: 0, wallets: 0, tokens: 0 }
 
+/** Exactly the columns "Top actors" reads -- see the `actorWallets` query below. */
+type ActorWallet = Pick<WalletRow, 'address' | 'info_score' | 'label' | 'total_volume'>
+
 /** Tutto ciò che la Dashboard legge in un giro. */
 interface DashboardData {
   buckets: Bucket[]
@@ -43,7 +46,7 @@ interface DashboardData {
   marketSeries: Map<string, number[]>
   topActors: TopEntity[]
   actorSeries: Map<string, number[]>
-  actorWallets: WalletRow[]
+  actorWallets: ActorWallet[]
   infoPop: number[]
   book: PositionTotals
   exposure: ExposureMarket[]
@@ -84,8 +87,10 @@ export default function Dashboard() {
       alertEntitySeries(def, start, end, 'market', marketKeys),
       alertEntitySeries(def, start, end, 'wallet', actorKeys),
       actorKeys.length
-        ? unwrap(supabase.from('wallets').select('*').in('address', actorKeys))
-        : Promise.resolve([] as WalletRow[]),
+        ? unwrap<ActorWallet[]>(
+            supabase.from('wallets').select('address, info_score, label, total_volume').in('address', actorKeys),
+          )
+        : Promise.resolve([] as ActorWallet[]),
       unwrap(
         supabase.from('wallets').select('info_score')
           .order('info_score', { ascending: false }).limit(500),
@@ -100,7 +105,7 @@ export default function Dashboard() {
       marketSeries: mSeries,
       topActors: actorRes,
       actorSeries: aSeries,
-      actorWallets: (actorWallets as WalletRow[]) ?? [],
+      actorWallets: actorWallets ?? [],
       infoPop: ((pop as { info_score: number }[]) ?? [])
         .map((w) => w.info_score).sort((a, b) => a - b),
       book: bookRes,
