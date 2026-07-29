@@ -74,10 +74,19 @@ export default function ClusterGraph() {
     return map
   }, [positions])
 
+  const maxWalletCount = useMemo(
+    () => Math.max(2, ...clusters.map((c) => c.wallet_count)),
+    [clusters],
+  )
+
   const visible = useMemo(
     () => clusters.filter((c) => c.wallet_count >= minWallets),
     [clusters, minWallets],
   )
+
+  useEffect(() => {
+    setMinWallets((w) => Math.min(w, maxWalletCount))
+  }, [maxWalletCount])
 
   const totals = useMemo(() => ({
     notional: visible.reduce((s, c) => s + c.total_notional_usd, 0),
@@ -257,7 +266,7 @@ export default function ClusterGraph() {
           <input
             type="range"
             min={2}
-            max={10}
+            max={maxWalletCount}
             value={minWallets}
             onChange={(e) => setMinWallets(Number(e.target.value))}
             className="w-24 accent-[#22C55E]"
