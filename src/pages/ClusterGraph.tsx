@@ -1,12 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import * as d3 from 'd3'
-import { supabase } from '../lib/supabaseClient'
+import { supabase, unwrap } from '../lib/supabaseClient'
+import { useSupabaseQuery } from '../hooks/useSupabaseQuery'
 import { useRange } from '../context/RangeProvider'
 import { outcomeColor, shortAddress, type ClusterLeg, type ClusterRow, type PositionRow } from '../lib/types'
 import { INK, RAMP, SERIES, rampStep } from '../lib/theme'
 import { ago, compact, usd } from '../lib/format'
 import FilterBar from '../components/FilterBar'
+import LoadError from '../components/LoadError'
+import CapNotice from '../components/CapNotice'
 import Panel from '../components/viz/Panel'
 import StatTile from '../components/viz/StatTile'
 import MiniBar from '../components/viz/MiniBar'
@@ -29,38 +32,39 @@ interface GraphLink extends d3.SimulationLinkDatum<GraphNode> {
 
 const HEIGHT = 520
 const NODE_CAP = 400
+/** Membri disegnati per cluster: oltre, il cluster è reso solo in parte. */
+const MEMBERS_PER_CLUSTER = 60
+const CLUSTER_CAP = 200
+const POSITION_CAP = 5000
 
 export default function ClusterGraph() {
   const svgRef = useRef<SVGSVGElement>(null)
   const navigate = useNavigate()
   const { nonce } = useRange()
 
-  const [clusters, setClusters] = useState<ClusterRow[]>([])
-  const [positions, setPositions] = useState<Pick<PositionRow, 'wallet_address' | 'notional_usd'>[]>([])
   const [selected, setSelected] = useState<string | null>(null)
   const [minWallets, setMinWallets] = useState(2)
-  const [loading, setLoading] = useState(true)
   const [hover, setHover] = useState<{ x: number; y: number; node: GraphNode } | null>(null)
 
-  useEffect(() => {
-    let cancelled = false
-    const load = async () => {
-      setLoading(true)
-      // The backend owns cluster membership now (GET /clusters -> ClusterTracker).
-      // Deriving it here from alert co-occurrence would be a weaker guess that
-      // disagrees with the engine's own numbers.
-      const [clusterRes, posRes] = await Promise.all([
-        supabase.from('clusters').select('*').order('total_notional_usd', { ascending: false }).limit(200),
-        supabase.from('positions').select('wallet_address, notional_usd').limit(5000),
-      ])
-      if (cancelled) return
-      setClusters((clusterRes.data as ClusterRow[]) ?? [])
-      setPositions((posRes.data as Pick<PositionRow, 'wallet_address' | 'notional_usd'>[]) ?? [])
-      setLoading(false)
-    }
-    void load()
-    return () => { cancelled = true }
+  const query = useSupabaseQuery(async () => {
+    // The backend owns cluster membership now (GET /clusters -> ClusterTracker).
+    // Deriving it here from alert co-occurrence would be a weaker guess that
+    // disagrees with the engine's own numbers.
+    const [clusters, positions] = await Promise.all([
+      unwrap<ClusterRow[]>(
+        supabase.from('clusters').select('*')
+          .order('total_notional_usd', { ascending: false }).limit(CLUSTER_CAP),
+      ),
+      unwrap<Pick<PositionRow, 'wallet_address' | 'notional_usd'>[]>(
+        supabase.from('positions').select('wallet_address, notional_usd').limit(POSITION_CAP),
+      ),
+    ])
+    return { clusters: clusters ?? [], positions: positions ?? [] }
   }, [nonce])
+
+  const clusters = useMemo(() => query.data?.clusters ?? [], [query.data])
+  const positions = useMemo(() => query.data?.positions ?? [], [query.data])
+  const loading = query.isLoading
 
   const notionalByWallet = useMemo(() => {
     const map = new Map<string, number>()
@@ -88,9 +92,12 @@ export default function ClusterGraph() {
     const nodes: GraphNode[] = []
     const links: GraphLink[] = []
     const maxNotional = Math.max(1, ...[...notionalByWallet.values()])
+    // Quanti membri i cluster visibili dichiarano in totale: serve a dire a
+    // schermo quanti ne restano fuori quando la potatura scatta.
+    const members_total = visible.reduce((s, c) => s + (c.wallets?.length ?? 0), 0)
 
     visible.forEach((c, clusterIndex) => {
-      const members = (c.wallets ?? []).slice(0, 60)
+      const members = (c.wallets ?? []).slice(0, MEMBERS_PER_CLUSTER)
       if (members.length === 0) return
       const anchor = c.cluster_key
       for (const id of members) {
@@ -112,7 +119,11 @@ export default function ClusterGraph() {
     })
 
     const present = new Set(nodes.map((n) => n.id))
-    return { nodes, links: links.filter((l) => present.has(l.source as string) && present.has(l.target as string)) }
+    return {
+      nodes,
+      links: links.filter((l) => present.has(l.source as string) && present.has(l.target as string)),
+      membersTotal: members_total,
+    }
   }, [visible, notionalByWallet])
 
   const active = useMemo(
@@ -259,6 +270,21 @@ export default function ClusterGraph() {
       </FilterBar>
 
       <div className="space-y-3">
+        {query.error && <LoadError message={query.error} onRetry={query.refresh} />}
+
+        <CapNotice
+          shown={clusters.length}
+          cap={CLUSTER_CAP}
+          unit="cluster"
+          hint="ordinati per capitale: i cluster più piccoli non sono stati letti"
+        />
+        <CapNotice
+          shown={positions.length}
+          cap={POSITION_CAP}
+          unit="posizioni"
+          hint="la dimensione dei nodi usa solo le posizioni lette"
+        />
+
         <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-5">
           <StatTile label="Combined capital at risk" accent={SERIES[0]} value={usd(totals.notional)} footnote={`${visible.length} clusters`} />
           <StatTile label="Unrealized P&L" accent={SERIES[1]} value={usd(totals.unrealized)} footnote={totals.unrealized >= 0 ? '▲ in profit' : '▼ in loss'} />
@@ -370,6 +396,17 @@ export default function ClusterGraph() {
             </span>
           }
         >
+          {/* La potatura del grafo è invisibile per costruzione: un nodo che non
+              c'è non lascia traccia. Va detta, altrimenti un cluster reso a
+              metà si legge come un cluster piccolo. */}
+          <CapNotice
+            shown={graph.nodes.length}
+            cap={NODE_CAP}
+            total={graph.membersTotal}
+            unit="nodi"
+            hint={`grafo potato a ${NODE_CAP} nodi (max ${MEMBERS_PER_CLUSTER} per cluster) — alza "min membri" per restringere`}
+          />
+
           <div className="relative">
             <svg ref={svgRef} className="w-full" style={{ height: HEIGHT, background: INK.surface }} />
 

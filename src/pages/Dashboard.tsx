@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { supabase } from '../lib/supabaseClient'
+import { supabase, unwrap } from '../lib/supabaseClient'
+import { useSupabaseQuery } from '../hooks/useSupabaseQuery'
 import { useRange } from '../context/RangeProvider'
 import type { Bucket } from '../lib/range'
 import {
@@ -33,23 +34,25 @@ const LIVE_THROTTLE_MS = 15_000
 const EMPTY_STATS: WindowStats = { total: 0, severe: 0, wallets: 0, markets: 0 }
 const EMPTY_BOOK: PositionTotals = { notional: 0, unrealized: 0, openLegs: 0, wallets: 0, tokens: 0 }
 
+/** Tutto ciò che la Dashboard legge in un giro. */
+interface DashboardData {
+  buckets: Bucket[]
+  curr: WindowStats
+  prev: WindowStats
+  topMarkets: TopEntity[]
+  marketSeries: Map<string, number[]>
+  topActors: TopEntity[]
+  actorSeries: Map<string, number[]>
+  actorWallets: WalletRow[]
+  infoPop: number[]
+  book: PositionTotals
+  exposure: ExposureMarket[]
+  tape: AlertTradeRow[]
+}
+
 export default function Dashboard() {
   const { def, key, nonce, start, end, prevStart } = useRange()
 
-  const [buckets, setBuckets] = useState<Bucket[]>([])
-  const [curr, setCurr] = useState<WindowStats>(EMPTY_STATS)
-  const [prev, setPrev] = useState<WindowStats>(EMPTY_STATS)
-  const [topMarkets, setTopMarkets] = useState<TopEntity[]>([])
-  const [marketSeries, setMarketSeries] = useState<Map<string, number[]>>(new Map())
-  const [topActors, setTopActors] = useState<TopEntity[]>([])
-  const [actorSeries, setActorSeries] = useState<Map<string, number[]>>(new Map())
-  const [actorWallets, setActorWallets] = useState<WalletRow[]>([])
-  const [infoPop, setInfoPop] = useState<number[]>([])
-  const [book, setBook] = useState<PositionTotals>(EMPTY_BOOK)
-  const [exposure, setExposure] = useState<ExposureMarket[]>([])
-  const [tape, setTape] = useState<AlertTradeRow[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
   const [hidden, setHidden] = useState<Set<string>>(new Set())
   const flashRef = useRef<Set<number>>(new Set())
 
@@ -58,67 +61,74 @@ export default function Dashboard() {
   const [liveNonce, setLiveNonce] = useState(0)
   const lastLiveRef = useRef(0)
 
-  useEffect(() => {
-    let cancelled = false
-    const load = async () => {
-      setLoading(true)
-      try {
-        // Everything below is aggregated in Postgres, so the payload is
-        // proportional to the bucket count, not to the size of `alerts`.
-        const [
-          bucketRes, currRes, prevRes, marketRes, actorRes, bookRes, exposureRes, tapeRes,
-        ] = await Promise.all([
-          alertBuckets(def, start, end),
-          alertWindowStats(start, end, SEVERE),
-          alertWindowStats(prevStart, start - 1, SEVERE),
-          alertTopEntities(start, end, 'market', 8),
-          alertTopEntities(start, end, 'wallet', 8),
-          positionTotals(),
-          positionTopMarkets(8),
-          supabase.from('alert_trades').select('*').order('id', { ascending: false }).limit(20),
-        ])
-        if (cancelled) return
+  const query = useSupabaseQuery<DashboardData>(async () => {
+    // Everything below is aggregated in Postgres, so the payload is
+    // proportional to the bucket count, not to the size of `alerts`.
+    const [bucketRes, currRes, prevRes, marketRes, actorRes, bookRes, exposureRes, tapeRes] =
+      await Promise.all([
+        alertBuckets(def, start, end),
+        alertWindowStats(start, end, SEVERE),
+        alertWindowStats(prevStart, start - 1, SEVERE),
+        alertTopEntities(start, end, 'market', 8),
+        alertTopEntities(start, end, 'wallet', 8),
+        positionTotals(),
+        positionTopMarkets(8),
+        unwrap(supabase.from('alert_trades').select('*').order('id', { ascending: false }).limit(20)),
+      ])
 
-        const marketKeys = marketRes.map((m) => m.key)
-        const actorKeys = actorRes.map((a) => a.key)
+    const marketKeys = marketRes.map((m) => m.key)
+    const actorKeys = actorRes.map((a) => a.key)
 
-        // Shapes and wallet profiles only for the rows actually rendered.
-        const [mSeries, aSeries, walletRes, popRes] = await Promise.all([
-          alertEntitySeries(def, start, end, 'market', marketKeys),
-          alertEntitySeries(def, start, end, 'wallet', actorKeys),
-          actorKeys.length
-            ? supabase.from('wallets').select('*').in('address', actorKeys)
-            : Promise.resolve({ data: [] as WalletRow[] }),
-          supabase.from('wallets').select('info_score').order('info_score', { ascending: false }).limit(500),
-        ])
-        if (cancelled) return
+    // Shapes and wallet profiles only for the rows actually rendered.
+    const [mSeries, aSeries, actorWallets, pop] = await Promise.all([
+      alertEntitySeries(def, start, end, 'market', marketKeys),
+      alertEntitySeries(def, start, end, 'wallet', actorKeys),
+      actorKeys.length
+        ? unwrap(supabase.from('wallets').select('*').in('address', actorKeys))
+        : Promise.resolve([] as WalletRow[]),
+      unwrap(
+        supabase.from('wallets').select('info_score')
+          .order('info_score', { ascending: false }).limit(500),
+      ),
+    ])
 
-        setBuckets(bucketRes)
-        setCurr(currRes)
-        setPrev(prevRes)
-        setTopMarkets(marketRes)
-        setMarketSeries(mSeries)
-        setTopActors(actorRes)
-        setActorSeries(aSeries)
-        setActorWallets((walletRes.data as WalletRow[]) ?? [])
-        setInfoPop(
-          (((popRes.data as { info_score: number }[]) ?? []).map((w) => w.info_score)).sort((a, b) => a - b),
-        )
-        setBook(bookRes)
-        setExposure(exposureRes)
-        setTape((tapeRes.data as AlertTradeRow[]) ?? [])
-        setError(null)
-      } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e))
-      } finally {
-        if (!cancelled) setLoading(false)
-      }
+    return {
+      buckets: bucketRes,
+      curr: currRes,
+      prev: prevRes,
+      topMarkets: marketRes,
+      marketSeries: mSeries,
+      topActors: actorRes,
+      actorSeries: aSeries,
+      actorWallets: (actorWallets as WalletRow[]) ?? [],
+      infoPop: ((pop as { info_score: number }[]) ?? [])
+        .map((w) => w.info_score).sort((a, b) => a - b),
+      book: bookRes,
+      exposure: exposureRes,
+      tape: (tapeRes as AlertTradeRow[]) ?? [],
     }
-    void load()
-    return () => { cancelled = true }
   }, [key, nonce, liveNonce, def, start, end, prevStart])
 
-  // Live tape: new inserts land at the top and flash once.
+  const d = query.data
+  const loading = query.isLoading
+  const buckets = d?.buckets ?? []
+  const curr = d?.curr ?? EMPTY_STATS
+  const prev = d?.prev ?? EMPTY_STATS
+  const topMarkets = d?.topMarkets ?? []
+  const marketSeries = d?.marketSeries ?? new Map<string, number[]>()
+  const topActors = d?.topActors ?? []
+  const actorSeries = d?.actorSeries ?? new Map<string, number[]>()
+  const actorWallets = d?.actorWallets ?? []
+  const infoPop = d?.infoPop ?? []
+  const book = d?.book ?? EMPTY_BOOK
+  const exposure = d?.exposure ?? []
+
+  // Il nastro è l'unica cosa che muta fuori dal fetch: le INSERT realtime lo
+  // fanno crescere in testa, quindi vive in uno stato suo e si risincronizza
+  // quando la query ricarica.
+  const [tape, setTape] = useState<AlertTradeRow[]>([])
+  useEffect(() => { if (d?.tape) setTape(d.tape) }, [d?.tape])
+
   useEffect(() => {
     const channel = supabase
       .channel('dashboard-feed')
@@ -193,7 +203,7 @@ export default function Dashboard() {
       />
 
       <div className="space-y-3">
-        {error && <LoadError message={error} />}
+        {query.error && <LoadError message={query.error} onRetry={query.refresh} />}
 
         <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-5">
           <StatTile

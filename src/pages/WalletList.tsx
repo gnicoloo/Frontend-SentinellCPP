@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { supabase } from '../lib/supabaseClient'
+import { supabase, unwrap, unwrapWithCount } from '../lib/supabaseClient'
+import { useSupabaseQuery } from '../hooks/useSupabaseQuery'
 import { useRange } from '../context/RangeProvider'
 import { shortAddress, type WalletRow } from '../lib/types'
 import { alertEntitySeries, alertWalletCounts, positionWalletTotals } from '../lib/aggregates'
@@ -9,6 +10,7 @@ import { compact, percentileOf, pct, usd } from '../lib/format'
 import { quantile } from '../lib/stats'
 import FilterBar from '../components/FilterBar'
 import LoadError from '../components/LoadError'
+import CapNotice from '../components/CapNotice'
 import Panel from '../components/viz/Panel'
 import Histogram from '../components/viz/Histogram'
 import MiniBar from '../components/viz/MiniBar'
@@ -66,55 +68,46 @@ const REGISTRY_CAP = 500
 
 export default function WalletList() {
   const { def, key: rangeKey, nonce, start, end } = useRange()
-  const [wallets, setWallets] = useState<WalletRow[]>([])
-  const [flowCounts, setFlowCounts] = useState<Map<string, number>>(new Map())
-  const [bookTotals, setBookTotals] = useState<Map<string, { notional: number; unrealized: number }>>(new Map())
   const [seriesMap, setSeriesMap] = useState<Map<string, number[]>>(new Map())
+  const [seriesError, setSeriesError] = useState<string | null>(null)
   const [search, setSearch] = useState('')
   const [sortKey, setSortKey] = useState<SortKey>('info_score')
   const [desc, setDesc] = useState(true)
   const [labeledOnly, setLabeledOnly] = useState(false)
   const [activeOnly, setActiveOnly] = useState(false)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
   const [pageSize, setPageSize] = useState<number>(PAGE_SIZE_OPTIONS[0])
   const [pageRaw, setPage] = useState(0)
 
-  useEffect(() => {
-    let cancelled = false
-    const load = async () => {
-      setLoading(true)
-      try {
-        const walletRes = await supabase
-          .from('wallets').select('*')
+  const query = useSupabaseQuery(async () => {
+    const [rows, registry] = await Promise.all([
+      unwrap<WalletRow[]>(
+        supabase.from('wallets').select('*')
           .order('info_score', { ascending: false })
-          .limit(REGISTRY_CAP)
-        if (cancelled) return
-        if (walletRes.error) throw new Error(walletRes.error.message)
-        const rows = (walletRes.data as WalletRow[]) ?? []
-        const addresses = rows.map((w) => w.address)
+          .limit(REGISTRY_CAP),
+      ),
+      // Il totale reale serve a dire quanti wallet restano fuori dal cap.
+      unwrapWithCount<{ address: string }[]>(
+        supabase.from('wallets').select('address', { count: 'exact', head: true }),
+      ),
+    ])
+    const total = registry.count
+    const addresses = rows.map((w) => w.address)
 
-        // Flow and exposure are summed in Postgres for exactly these addresses.
-        // Pulling raw alert/position rows and grouping them here meant the
-        // derived columns only ever reflected whatever the row cap admitted.
-        const [counts, book] = await Promise.all([
-          alertWalletCounts(start, end, addresses),
-          positionWalletTotals(addresses),
-        ])
-        if (cancelled) return
-        setWallets(rows)
-        setFlowCounts(counts)
-        setBookTotals(book)
-        setError(null)
-      } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e))
-      } finally {
-        if (!cancelled) setLoading(false)
-      }
-    }
-    void load()
-    return () => { cancelled = true }
+    // Flow and exposure are summed in Postgres for exactly these addresses.
+    // Pulling raw alert/position rows and grouping them here meant the
+    // derived columns only ever reflected whatever the row cap admitted.
+    const [flowCounts, bookTotals] = await Promise.all([
+      alertWalletCounts(start, end, addresses),
+      positionWalletTotals(addresses),
+    ])
+    return { rows, flowCounts, bookTotals, total }
   }, [rangeKey, nonce, start, end])
+
+  const wallets = query.data?.rows ?? []
+  const flowCounts = query.data?.flowCounts ?? new Map<string, number>()
+  const bookTotals = query.data?.bookTotals ?? new Map<string, { notional: number; unrealized: number }>()
+  const registryTotal = query.data?.total ?? 0
+  const loading = query.isLoading
 
   const screened = useMemo<Screened[]>(() => {
     const infoPop = wallets.map((w) => w.info_score).sort((a, b) => a - b)
@@ -168,7 +161,7 @@ export default function WalletList() {
     }
     void alertEntitySeries(def, start, end, 'wallet', addresses)
       .then((m) => { if (!cancelled) setSeriesMap(m) })
-      .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : String(e)) })
+      .catch((e) => { if (!cancelled) setSeriesError(e instanceof Error ? e.message : String(e)) })
     return () => { cancelled = true }
   }, [visibleKey, def, start, end])
 
@@ -201,7 +194,17 @@ export default function WalletList() {
       </FilterBar>
 
       <div className="space-y-3">
-        {error && <LoadError message={error} />}
+        {(query.error || seriesError) && (
+          <LoadError message={query.error ?? seriesError ?? ''} onRetry={query.refresh} />
+        )}
+
+        <CapNotice
+          shown={wallets.length}
+          cap={REGISTRY_CAP}
+          total={registryTotal}
+          unit="wallet"
+          hint="il registro è ordinato per info score: i wallet oltre il cap non entrano nello screener"
+        />
 
         <Panel
           title={`Distribution · ${sortCol.label}`}

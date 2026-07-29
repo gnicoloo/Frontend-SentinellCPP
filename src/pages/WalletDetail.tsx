@@ -3,7 +3,8 @@ import { Link, useParams } from 'react-router-dom'
 import {
   PolarAngleAxis, PolarGrid, PolarRadiusAxis, Radar, RadarChart, ResponsiveContainer, Tooltip,
 } from 'recharts'
-import { supabase } from '../lib/supabaseClient'
+import { supabase, unwrap } from '../lib/supabaseClient'
+import { useSupabaseQuery } from '../hooks/useSupabaseQuery'
 import { useRange } from '../context/RangeProvider'
 import type { Bucket } from '../lib/range'
 import {
@@ -19,6 +20,7 @@ import { ago, compact, ordinal, percentileOf, pct, usd } from '../lib/format'
 import { median } from '../lib/stats'
 import FilterBar from '../components/FilterBar'
 import LoadError from '../components/LoadError'
+import CapNotice from '../components/CapNotice'
 import Panel from '../components/viz/Panel'
 import StatTile from '../components/viz/StatTile'
 import ScoreMeter from '../components/viz/ScoreMeter'
@@ -59,6 +61,13 @@ interface DeceptionRow {
   asymmetry_score: number | null
 }
 
+/** Popolazione di riferimento per i percentili di pagina. */
+const PEER_CAP = 500
+/** Il log alert è una lista, non un aggregato: resta capped e lo dichiara. */
+const ALERT_LOG_CAP = 500
+
+const EMPTY_LIFETIME: WindowStats = { total: 0, severe: 0, wallets: 0, markets: 0 }
+
 export default function WalletDetail() {
   const { address = '' } = useParams()
   // Every address is stored lowercase (EIP-55 is only a display checksum), so
@@ -67,86 +76,79 @@ export default function WalletDetail() {
   const addr = useMemo(() => address.trim().toLowerCase(), [address])
   const { def, key: rangeKey, nonce, start, end } = useRange()
 
-  const [wallet, setWallet] = useState<WalletRow | null>(null)
-  const [peers, setPeers] = useState<WalletRow[]>([])
-  const [alerts, setAlerts] = useState<AlertRow[]>([])
-  const [moves, setMoves] = useState<SuspectMove[]>([])
-  const [positions, setPositions] = useState<PositionRow[]>([])
-  const [twaps, setTwaps] = useState<TwapPatternRow[]>([])
-  const [deception, setDeception] = useState<DeceptionRow | null>(null)
-  const [buckets, setBuckets] = useState<Bucket[]>([])
-  const [topBooks, setTopBooks] = useState<TopEntity[]>([])
-  const [lifetime, setLifetime] = useState<WindowStats>({ total: 0, severe: 0, wallets: 0, markets: 0 })
-  const [error, setError] = useState<string | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [notFound, setNotFound] = useState(false)
   const [hidden, setHidden] = useState<Set<string>>(new Set())
   const [copied, setCopied] = useState(false)
 
-  useEffect(() => {
-    let cancelled = false
-    const load = async () => {
-      setLoading(true)
-      try {
-      const [
-        walletRes, peerRes, alertRes, moveRes, decRes, posRes, twapRes,
-        bucketRes, bookRes, countRes,
-      ] = await Promise.all([
-        supabase.from('wallets').select('*').eq('address', addr).maybeSingle(),
-        supabase.from('wallets').select('*').order('info_score', { ascending: false }).limit(500),
-        supabase.from('alerts').select('*').eq('wallet_address', addr).order('timestamp_ms', { ascending: false }).limit(500),
-        supabase.from('suspect_moves').select('*').eq('wallet_address', addr).order('timestamp_ms', { ascending: false }).limit(100),
+  const query = useSupabaseQuery(async () => {
+    const [
+      walletRow, peers, alerts, moves, dec, positions, twaps,
+      buckets, topBooks, lifetime,
+    ] = await Promise.all([
+      unwrap<WalletRow | null>(supabase.from('wallets').select('*').eq('address', addr).maybeSingle()),
+      unwrap<WalletRow[]>(supabase.from('wallets').select('*').order('info_score', { ascending: false }).limit(PEER_CAP)),
+      unwrap<AlertRow[]>(supabase.from('alerts').select('*').eq('wallet_address', addr).order('timestamp_ms', { ascending: false }).limit(ALERT_LOG_CAP)),
+      unwrap<SuspectMove[]>(supabase.from('suspect_moves').select('*').eq('wallet_address', addr).order('timestamp_ms', { ascending: false }).limit(100)),
+      unwrap<DeceptionRow[]>(
         supabase
           .from('deception_alerts')
           .select('deception_score, roi_discrepancy_score, loss_cluster_score, asymmetry_score')
           .eq('wallet_address', addr)
           .order('id', { ascending: false })
           .limit(1),
+      ),
+      unwrap<PositionRow[]>(
         supabase
           .from('positions')
           .select('*')
           .eq('wallet_address', addr)
           .order('notional_usd', { ascending: false })
           .limit(200),
-        // jsonb containment. The value MUST be pre-stringified JSON: handed a
-        // JS array, postgrest-js emits a Postgres array literal (cs.{0x..}),
-        // which never matches a jsonb column.
+      ),
+      // jsonb containment. The value MUST be pre-stringified JSON: handed a
+      // JS array, postgrest-js emits a Postgres array literal (cs.{0x..}),
+      // which never matches a jsonb column.
+      unwrap<TwapPatternRow[]>(
         supabase
           .from('twap_patterns')
           .select('*')
           .contains('wallets', JSON.stringify([addr]))
           .order('end_time', { ascending: false })
           .limit(50),
-        // The timeline and the book ranking are aggregated in Postgres: the
-        // `alerts` fetch above is a capped LOG, and bucketing it would draw
-        // only as much history as the cap happened to admit.
-        alertBuckets(def, start, end, { wallet: addr }),
-        alertTopEntities(LIFETIME.start, LIFETIME.end, 'market', 8, addr),
-        alertWindowStats(LIFETIME.start, LIFETIME.end, [], addr),
-      ])
-      if (cancelled) return
-      setWallet((walletRes.data as WalletRow) ?? null)
-      setNotFound(!walletRes.data)
-      setPeers((peerRes.data as WalletRow[]) ?? [])
-      setAlerts((alertRes.data as AlertRow[]) ?? [])
-      setMoves((moveRes.data as SuspectMove[]) ?? [])
-      setPositions((posRes.data as PositionRow[]) ?? [])
-      setTwaps((twapRes.data as TwapPatternRow[]) ?? [])
-      setBuckets(bucketRes)
-      setTopBooks(bookRes)
-      setLifetime(countRes)
-      const d = decRes.data as DeceptionRow[] | null
-      setDeception(d && d.length > 0 ? d[0] : null)
-      setError(null)
-      } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e))
-      } finally {
-        if (!cancelled) setLoading(false)
-      }
+      ),
+      // The timeline and the book ranking are aggregated in Postgres: the
+      // `alerts` fetch above is a capped LOG, and bucketing it would draw
+      // only as much history as the cap happened to admit.
+      alertBuckets(def, start, end, { wallet: addr }),
+      alertTopEntities(LIFETIME.start, LIFETIME.end, 'market', 8, addr),
+      alertWindowStats(LIFETIME.start, LIFETIME.end, [], addr),
+    ])
+    return {
+      wallet: walletRow,
+      peers: peers ?? [],
+      alerts: alerts ?? [],
+      moves: moves ?? [],
+      positions: positions ?? [],
+      twaps: twaps ?? [],
+      deception: dec && dec.length > 0 ? dec[0] : null,
+      buckets,
+      topBooks,
+      lifetime,
     }
-    void load()
-    return () => { cancelled = true }
   }, [addr, rangeKey, nonce, def, start, end])
+
+  const wallet = query.data?.wallet ?? null
+  const peers = query.data?.peers ?? []
+  const alerts = query.data?.alerts ?? []
+  const moves = query.data?.moves ?? []
+  const positions = query.data?.positions ?? []
+  const twaps = query.data?.twaps ?? []
+  const deception = query.data?.deception ?? null
+  const buckets = query.data?.buckets ?? []
+  const topBooks = query.data?.topBooks ?? []
+  const lifetime = query.data?.lifetime ?? EMPTY_LIFETIME
+  const loading = query.isLoading
+  // "Non trovato" solo dopo una lettura riuscita: in errore non sappiamo nulla.
+  const notFound = query.status === 'success' && !query.data.wallet
 
   const windowFlow = useMemo(() => buckets.reduce((s, b) => s + b.total, 0), [buckets])
 
@@ -293,7 +295,14 @@ export default function WalletDetail() {
           )}
         </div>
 
-        {error && <LoadError message={error} />}
+        {query.error && <LoadError message={query.error} onRetry={query.refresh} />}
+
+        <CapNotice
+          shown={peers.length}
+          cap={PEER_CAP}
+          unit="peer"
+          hint="i percentili qui sotto sono calcolati su questo campione, non sull'intero registro"
+        />
 
         {notFound && (
           <p className="border-l-2 px-3 py-1.5 font-mono text-[10px] uppercase text-slate-400" style={{ borderColor: STATUS.warning }}>
@@ -690,6 +699,13 @@ export default function WalletDetail() {
             rows: alerts.slice(0, 200).map((a) => [alertLabel(a.alert_type), a.market_title ?? a.asset_id ?? '—', formatTs(a.timestamp_ms)]),
           }}
         >
+          <CapNotice
+            shown={alerts.length}
+            cap={ALERT_LOG_CAP}
+            total={lifetime.total}
+            unit="alert"
+            hint="usa l'Alert Explorer per sfogliare lo storico completo"
+          />
           <ul className="max-h-72 divide-y divide-sentinel-border/40 overflow-y-auto">
             {alerts.length === 0 && <li className="px-3 py-4 font-mono text-[10px] uppercase text-slate-600">no events logged</li>}
             {alerts.map((a) => (

@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Una PR che riceve più push non deve tenere occupati N runner: conta solo
+# l'ultimo commit.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # `npm ci` (non `install`): rispetta il lockfile e fallisce se è
+      # disallineato da package.json, invece di aggiornarlo in silenzio.
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      # Il build va per ultimo: se i tipi o i test sono rotti si sa prima,
+      # senza aspettare il bundling.
+      #
+      # Nota: senza VITE_SUPABASE_* il bundle si costruisce comunque (il client
+      # logga un warning a runtime, non a build time), quindi la CI non ha
+      # bisogno di segreti per verificare che il progetto compili.
+      - name: Build
+        run: npm run build

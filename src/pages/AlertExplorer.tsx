@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { supabase } from '../lib/supabaseClient'
+import { supabase, unwrap, unwrapWithCount } from '../lib/supabaseClient'
+import { useSupabaseQuery } from '../hooks/useSupabaseQuery'
 import { useRange } from '../context/RangeProvider'
 import type { Bucket } from '../lib/range'
 import {
@@ -12,6 +13,7 @@ import { SERIES, STATUS } from '../lib/theme'
 import { ago, compact, duration } from '../lib/format'
 import FilterBar from '../components/FilterBar'
 import LoadError from '../components/LoadError'
+import CapNotice from '../components/CapNotice'
 import Panel from '../components/viz/Panel'
 import ActivityChart from '../components/viz/ActivityChart'
 import Legend from '../components/viz/Legend'
@@ -41,18 +43,14 @@ export default function AlertExplorer() {
   const { def, key: rangeKey, nonce, start, end } = useRange()
   const [params, setParams] = useSearchParams()
 
-  const [rows, setRows] = useState<AlertRow[]>([])
-  const [buckets, setBuckets] = useState<Bucket[]>([])
-  const [error, setError] = useState<string | null>(null)
-  const [total, setTotal] = useState(0)
   const [page, setPage] = useState(0)
   const [types, setTypes] = useState<Set<string>>(new Set())
   const [wallet, setWallet] = useState('')
   const [market, setMarket] = useState(params.get('market') ?? '')
   const [selected, setSelected] = useState<AlertRow | null>(null)
   const [cursor, setCursor] = useState(0)
-  const [loading, setLoading] = useState(true)
   const [exporting, setExporting] = useState(false)
+  const [exportError, setExportError] = useState<string | null>(null)
   const tableRef = useRef<HTMLTableSectionElement>(null)
 
   // A market link from another view seeds the filter exactly once.
@@ -78,36 +76,30 @@ export default function AlertExplorer() {
     [start, end, types, wallet, market],
   )
 
-  useEffect(() => {
-    let cancelled = false
-    const load = async () => {
-      setLoading(true)
-      try {
-        // The density chart is aggregated in Postgres over the WHOLE filtered
-        // slice. Sampling rows for it -- capped, and previously unordered --
-        // drew whichever fraction the cap happened to admit.
-        const [pageRes, bucketRes] = await Promise.all([
-          applyFilters(supabase.from('alerts').select('*', { count: 'exact' }))
-            .order('timestamp_ms', { ascending: false })
-            .range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1),
-          alertBuckets(def, start, end, { walletLike: wallet, market, types: [...types] }),
-        ])
-        if (cancelled) return
-        if (pageRes.error) throw new Error(pageRes.error.message)
-        setRows((pageRes.data as AlertRow[]) ?? [])
-        setTotal(pageRes.count ?? 0)
-        setBuckets(bucketRes)
-        setCursor(0)
-        setError(null)
-      } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e))
-      } finally {
-        if (!cancelled) setLoading(false)
-      }
-    }
-    void load()
-    return () => { cancelled = true }
+  // La paginazione resta server-side: l'hook incapsula solo errore, loading e
+  // cancellazione, non tocca il modo in cui la pagina viene richiesta.
+  const query = useSupabaseQuery(async () => {
+    // The density chart is aggregated in Postgres over the WHOLE filtered
+    // slice. Sampling rows for it -- capped, and previously unordered --
+    // drew whichever fraction the cap happened to admit.
+    const [pageRes, buckets] = await Promise.all([
+      unwrapWithCount<AlertRow[]>(
+        applyFilters(supabase.from('alerts').select('*', { count: 'exact' }))
+          .order('timestamp_ms', { ascending: false })
+          .range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1),
+      ),
+      alertBuckets(def, start, end, { walletLike: wallet, market, types: [...types] }),
+    ])
+    return { rows: pageRes.rows ?? [], total: pageRes.count, buckets }
   }, [applyFilters, page, rangeKey, nonce, def, start, end, wallet, market, types])
+
+  const rows = useMemo(() => query.data?.rows ?? [], [query.data])
+  const total = query.data?.total ?? 0
+  const buckets = query.data?.buckets ?? []
+  const loading = query.isLoading
+
+  // Il cursore da tastiera riparte in cima a ogni nuovo result set.
+  useEffect(() => { setCursor(0) }, [rows])
 
   // Filters reset the page: staying on page 7 of a 2-page result shows nothing.
   useEffect(() => { setPage(0) }, [types, wallet, market, rangeKey])
@@ -143,10 +135,20 @@ export default function AlertExplorer() {
   /** Exports the whole filtered slice, not just the visible page. */
   const exportAll = async (kind: 'csv' | 'json') => {
     setExporting(true)
-    const { data } = await applyFilters(supabase.from('alerts').select('*'))
-      .order('timestamp_ms', { ascending: false })
-      .limit(HIST_CAP)
-    const all = (data as AlertRow[]) ?? []
+    setExportError(null)
+    let all: AlertRow[]
+    try {
+      // Senza unwrap un export fallito scaricava un file vuoto senza dire nulla.
+      all = await unwrap<AlertRow[]>(
+        applyFilters(supabase.from('alerts').select('*'))
+          .order('timestamp_ms', { ascending: false })
+          .limit(HIST_CAP),
+      ) ?? []
+    } catch (e) {
+      setExportError(e instanceof Error ? e.message : String(e))
+      setExporting(false)
+      return
+    }
     if (kind === 'json') {
       download('sentinel_alerts.json', JSON.stringify(all, null, 2), 'application/json')
     } else {
@@ -200,7 +202,16 @@ export default function AlertExplorer() {
       </FilterBar>
 
       <div className="space-y-3">
-        {error && <LoadError message={error} />}
+        {query.error && <LoadError message={query.error} onRetry={query.refresh} />}
+        {exportError && <LoadError message={`export: ${exportError}`} />}
+
+        <CapNotice
+          shown={rows.length === 0 ? 0 : Math.min(total, HIST_CAP)}
+          cap={HIST_CAP}
+          total={total}
+          unit="alert"
+          hint="l'export CSV/JSON si ferma al cap: restringi il filtro per portarlo via tutto"
+        />
 
         <div className="flex flex-wrap items-center gap-1.5">
           <span className="font-mono text-[9px] uppercase tracking-wider text-slate-600">type</span>

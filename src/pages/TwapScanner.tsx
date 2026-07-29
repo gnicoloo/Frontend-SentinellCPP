@@ -1,12 +1,15 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { supabase } from '../lib/supabaseClient'
+import { supabase, unwrap } from '../lib/supabaseClient'
+import { useSupabaseQuery } from '../hooks/useSupabaseQuery'
 import { useRange } from '../context/RangeProvider'
 import { isCoordinated, shortAddress, twapDuration, type TwapPatternRow } from '../lib/types'
 import { SERIES } from '../lib/theme'
 import { ago, compact, duration } from '../lib/format'
 import { median } from '../lib/stats'
 import FilterBar from '../components/FilterBar'
+import LoadError from '../components/LoadError'
+import CapNotice from '../components/CapNotice'
 import Panel from '../components/viz/Panel'
 import StatTile from '../components/viz/StatTile'
 import Legend from '../components/viz/Legend'
@@ -23,36 +26,33 @@ const SERIES_KEYS = [
   { key: 'coordinated', label: 'Multi-wallet', color: COORDINATED },
 ]
 
+/** Finestre lette per intervallo: oltre questo tetto il quadro è parziale. */
+const WINDOW_CAP = 1000
+
 export default function TwapScanner() {
   const { def, key: rangeKey, nonce, start, end } = useRange()
   const navigate = useNavigate()
 
-  const [rows, setRows] = useState<TwapPatternRow[]>([])
-  const [loading, setLoading] = useState(true)
   const [coordOnly, setCoordOnly] = useState(false)
   const [marketFilter, setMarketFilter] = useState('')
 
-  useEffect(() => {
-    let cancelled = false
-    const load = async () => {
-      setLoading(true)
-      // A window overlaps the range when it starts before the range ends and
-      // ends after the range begins -- filtering on start_time alone would
-      // drop long executions already running when the window opened.
-      const { data } = await supabase
+  const query = useSupabaseQuery(async () => {
+    // A window overlaps the range when it starts before the range ends and
+    // ends after the range begins -- filtering on start_time alone would
+    // drop long executions already running when the window opened.
+    return unwrap<TwapPatternRow[]>(
+      supabase
         .from('twap_patterns')
         .select('*')
         .lte('start_time', end)
         .gte('end_time', start)
         .order('end_time', { ascending: false })
-        .limit(1000)
-      if (cancelled) return
-      setRows((data as TwapPatternRow[]) ?? [])
-      setLoading(false)
-    }
-    void load()
-    return () => { cancelled = true }
+        .limit(WINDOW_CAP),
+    )
   }, [rangeKey, nonce, start, end])
+
+  const rows = useMemo(() => query.data ?? [], [query.data])
+  const loading = query.isLoading
 
   const filtered = useMemo(() => {
     const needle = marketFilter.trim().toLowerCase()
@@ -153,6 +153,15 @@ export default function TwapScanner() {
       </FilterBar>
 
       <div className="space-y-3">
+        {query.error && <LoadError message={query.error} onRetry={query.refresh} />}
+
+        <CapNotice
+          shown={rows.length}
+          cap={WINDOW_CAP}
+          unit="finestre"
+          hint="KPI e grafici qui sotto descrivono solo le finestre lette — restringi l'intervallo"
+        />
+
         <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-6">
           <StatTile label="Execution windows" accent={SERIES[0]} value={compact(kpis.windows)} footnote={`overlapping ${def.label}`} />
           <StatTile label="Multi-wallet" accent={SERIES[1]} value={compact(kpis.coordinated)}

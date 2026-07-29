@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import { AuthProvider } from './context/AuthProvider'
 import { RangeProvider } from './context/RangeProvider'
+import ErrorBoundary from './components/ErrorBoundary'
 import ProtectedRoute from './components/ProtectedRoute'
 import Layout from './components/Layout'
 import Login from './pages/Login'
@@ -13,28 +14,32 @@ import TwapScanner from './pages/TwapScanner'
 
 export default function App() {
   return (
-    <AuthProvider>
-      <BrowserRouter>
-        <Routes>
-          <Route path="/login" element={<Login />} />
-          <Route element={<ProtectedRoute />}>
-            <Route
-              element={
-                <RangeProvider>
-                  <Layout />
-                </RangeProvider>
-              }
-            >
-              <Route path="/" element={<Dashboard />} />
-              <Route path="/alerts" element={<AlertExplorer />} />
-              <Route path="/wallets" element={<WalletList />} />
-              <Route path="/wallet/:address" element={<WalletDetail />} />
-              <Route path="/clusters" element={<ClusterGraph />} />
-              <Route path="/twap" element={<TwapScanner />} />
+    // Il boundary sta fuori da tutto: deve reggere anche un errore dei provider
+    // o del router, non solo di una pagina.
+    <ErrorBoundary>
+      <AuthProvider>
+        <BrowserRouter>
+          <Routes>
+            <Route path="/login" element={<Login />} />
+            <Route element={<ProtectedRoute />}>
+              <Route
+                element={
+                  <RangeProvider>
+                    <Layout />
+                  </RangeProvider>
+                }
+              >
+                <Route path="/" element={<Dashboard />} />
+                <Route path="/alerts" element={<AlertExplorer />} />
+                <Route path="/wallets" element={<WalletList />} />
+                <Route path="/wallet/:address" element={<WalletDetail />} />
+                <Route path="/clusters" element={<ClusterGraph />} />
+                <Route path="/twap" element={<TwapScanner />} />
+              </Route>
             </Route>
-          </Route>
-        </Routes>
-      </BrowserRouter>
-    </AuthProvider>
+          </Routes>
+        </BrowserRouter>
+      </AuthProvider>
+    </ErrorBoundary>
   )
 }
