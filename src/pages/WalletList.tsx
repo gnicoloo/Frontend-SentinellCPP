@@ -60,6 +60,7 @@ const COLUMNS: Column[] = [
 ]
 
 const ROW_CAP = 6000
+const PAGE_SIZE_OPTIONS = [50, 100, 250, 500] as const
 
 type PositionSlice = Pick<PositionRow, 'wallet_address' | 'notional_usd' | 'unrealized_pnl'>
 
@@ -74,6 +75,7 @@ export default function WalletList() {
   const [labeledOnly, setLabeledOnly] = useState(false)
   const [activeOnly, setActiveOnly] = useState(false)
   const [loading, setLoading] = useState(true)
+  const [pageSize, setPageSize] = useState<number>(PAGE_SIZE_OPTIONS[0])
 
   useEffect(() => {
     let cancelled = false
@@ -147,6 +149,8 @@ export default function WalletList() {
     return [...filtered].sort((a, b) => (Number(a[sortKey]) - Number(b[sortKey])) * dir)
   }, [filtered, sortKey, desc])
 
+  const visible = useMemo(() => sorted.slice(0, pageSize), [sorted, pageSize])
+
   const sortCol = COLUMNS.find((c) => c.key === sortKey)!
   const barMax = useMemo(() => {
     const vals = filtered.map((w) => Number(w[sortKey]))
@@ -199,8 +203,22 @@ export default function WalletList() {
 
         <Panel
           title="Registry"
-          meta={`click a header to sort · ${def.label} flow`}
+          meta={`click a header to sort · ${def.label} flow · showing ${compact(visible.length)} / ${compact(sorted.length)}`}
           loading={loading}
+          actions={
+            <label className="flex items-center gap-1.5 font-mono text-[9px] uppercase tracking-wider text-slate-500">
+              Rows
+              <select
+                value={pageSize}
+                onChange={(e) => setPageSize(Number(e.target.value))}
+                className="border border-sentinel-border bg-sentinel-bg px-1 py-0.5 font-mono text-[10px] text-slate-300 outline-none focus:border-sentinel-accent"
+              >
+                {PAGE_SIZE_OPTIONS.map((n) => (
+                  <option key={n} value={n}>{n}</option>
+                ))}
+              </select>
+            </label>
+          }
           table={{
             columns: ['Wallet', ...COLUMNS.map((c) => c.label)],
             rows: sorted.map((w) => [w.address, ...COLUMNS.map((c) => c.format(w))]),
@@ -231,7 +249,7 @@ export default function WalletList() {
                 {!loading && sorted.length === 0 && (
                   <tr><td colSpan={COLUMNS.length + 2} className="px-3 py-6 text-center font-mono text-[10px] uppercase text-slate-600">no wallets match the screen</td></tr>
                 )}
-                {sorted.map((w) => (
+                {visible.map((w) => (
                   <tr key={w.address} className="border-b border-sentinel-border/40 hover:bg-white/[0.03]">
                     <td className="px-3 py-1.5">
                       <Link to={`/wallet/${w.address}`} className="font-mono text-sentinel-accent hover:underline">
