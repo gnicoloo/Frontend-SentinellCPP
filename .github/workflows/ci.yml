@@ -20,8 +20,17 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
+
+      # Il lockfile è generato con npm 11: vitest 4 porta in dotazione un vite
+      # 7 (rolldown) annidato con un peer optional su esbuild ^0.27||^0.28, e
+      # npm 10 (quello di Node 20, e quello che Node 22 installa di default se
+      # non fissato) lo risolve diversamente -- "npm ci" fallisce con
+      # "Missing: esbuild@0.28.1 from lock file" anche se il lockfile è
+      # perfettamente valido. Fissare la major di npm elimina la discrepanza.
+      - name: Use npm 11
+        run: npm install -g npm@11
 
       # `npm ci` (non `install`): rispetta il lockfile e fallisce se è
       # disallineato da package.json, invece di aggiornarlo in silenzio.
