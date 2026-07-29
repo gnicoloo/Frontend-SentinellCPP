@@ -76,6 +76,7 @@ export default function WalletList() {
   const [activeOnly, setActiveOnly] = useState(false)
   const [loading, setLoading] = useState(true)
   const [pageSize, setPageSize] = useState<number>(PAGE_SIZE_OPTIONS[0])
+  const [pageRaw, setPage] = useState(0)
 
   useEffect(() => {
     let cancelled = false
@@ -149,7 +150,14 @@ export default function WalletList() {
     return [...filtered].sort((a, b) => (Number(a[sortKey]) - Number(b[sortKey])) * dir)
   }, [filtered, sortKey, desc])
 
-  const visible = useMemo(() => sorted.slice(0, pageSize), [sorted, pageSize])
+  const pageCount = Math.max(1, Math.ceil(sorted.length / pageSize))
+  const page = Math.min(pageRaw, pageCount - 1)
+  const visible = useMemo(
+    () => sorted.slice(page * pageSize, page * pageSize + pageSize),
+    [sorted, pageSize, page],
+  )
+
+  useEffect(() => { setPage(0) }, [search, labeledOnly, activeOnly, sortKey, desc, pageSize])
 
   const sortCol = COLUMNS.find((c) => c.key === sortKey)!
   const barMax = useMemo(() => {
@@ -203,21 +211,39 @@ export default function WalletList() {
 
         <Panel
           title="Registry"
-          meta={`click a header to sort · ${def.label} flow · showing ${compact(visible.length)} / ${compact(sorted.length)}`}
+          meta={`click a header to sort · ${def.label} flow · page ${page + 1}/${pageCount} · showing ${compact(visible.length)} / ${compact(sorted.length)}`}
           loading={loading}
           actions={
-            <label className="flex items-center gap-1.5 font-mono text-[9px] uppercase tracking-wider text-slate-500">
-              Rows
-              <select
-                value={pageSize}
-                onChange={(e) => setPageSize(Number(e.target.value))}
-                className="border border-sentinel-border bg-sentinel-bg px-1 py-0.5 font-mono text-[10px] text-slate-300 outline-none focus:border-sentinel-accent"
+            <>
+              <label className="flex items-center gap-1.5 font-mono text-[9px] uppercase tracking-wider text-slate-500">
+                Rows
+                <select
+                  value={pageSize}
+                  onChange={(e) => setPageSize(Number(e.target.value))}
+                  className="border border-sentinel-border bg-sentinel-bg px-1 py-0.5 font-mono text-[10px] text-slate-300 outline-none focus:border-sentinel-accent"
+                >
+                  {PAGE_SIZE_OPTIONS.map((n) => (
+                    <option key={n} value={n}>{n}</option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                onClick={() => setPage((p) => Math.max(0, p - 1))}
+                disabled={page === 0}
+                className="border border-sentinel-border px-2 py-0.5 font-mono text-[9px] uppercase tracking-wider text-slate-500 transition-colors hover:text-slate-200 disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:text-slate-500"
               >
-                {PAGE_SIZE_OPTIONS.map((n) => (
-                  <option key={n} value={n}>{n}</option>
-                ))}
-              </select>
-            </label>
+                Prev
+              </button>
+              <button
+                type="button"
+                onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))}
+                disabled={page >= pageCount - 1}
+                className="border border-sentinel-border px-2 py-0.5 font-mono text-[9px] uppercase tracking-wider text-slate-500 transition-colors hover:text-slate-200 disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:text-slate-500"
+              >
+                Next
+              </button>
+            </>
           }
           table={{
             columns: ['Wallet', ...COLUMNS.map((c) => c.label)],
