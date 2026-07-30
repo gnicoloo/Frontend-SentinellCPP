@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 
 export default function BreakingNewsTicker() {
   const [news, setNews] = useState<{ title: string; source: string; link: string }[]>([])
+  const [loading, setLoading] = useState(true)
 
   useEffect(() => {
     let active = true
@@ -14,38 +15,39 @@ export default function BreakingNewsTicker() {
     ]
 
     async function fetchNews() {
-      try {
-        const fetchPromises = feeds.map(async (feedUrl) => {
+      setLoading(true)
+      const allItems: any[] = []
+      let pending = feeds.length
+
+      feeds.forEach(async (feedUrl) => {
+        try {
           const rssUrl = encodeURIComponent(feedUrl)
           const res = await fetch(`https://api.rss2json.com/v1/api.json?rss_url=${rssUrl}`)
           const data = await res.json()
-          if (data.status === 'ok' && data.items) {
-            return data.items.slice(0, 5) // Prende i primi 5 da ogni feed
-          }
-          return []
-        })
-
-        const results = await Promise.all(fetchPromises)
-        const allItems = results.flat()
-
-        if (active && allItems.length > 0) {
-          // Mescoliamo le notizie per dare l'effetto "telegiornale" variegato
-          const shuffled = allItems.sort(() => 0.5 - Math.random())
           
-          const formattedItems = shuffled.slice(0, 15).map((item: any) => {
-            const parts = item.title.split(' - ')
-            const source = parts.length > 1 ? parts.pop() : 'Google News'
-            return {
-              title: parts.join(' - '),
-              source: source,
-              link: item.link
-            }
-          })
-          setNews(formattedItems)
+          if (active && data.status === 'ok' && data.items) {
+            allItems.push(...data.items.slice(0, 5))
+            
+            // Aggiorna lo stato progressivamente man mano che i feed rispondono
+            const shuffled = [...allItems].sort(() => 0.5 - Math.random())
+            const formattedItems = shuffled.slice(0, 15).map((item: any) => {
+              const parts = item.title.split(' - ')
+              const source = parts.length > 1 ? parts.pop() : 'Google News'
+              return {
+                title: parts.join(' - '),
+                source: source,
+                link: item.link
+              }
+            })
+            setNews(formattedItems)
+          }
+        } catch (err) {
+          console.error('Failed to fetch a feed', err)
+        } finally {
+          pending -= 1
+          if (pending === 0 && active) setLoading(false)
         }
-      } catch (err) {
-        console.error('Failed to fetch breaking news', err)
-      }
+      })
     }
 
     void fetchNews()
@@ -57,8 +59,6 @@ export default function BreakingNewsTicker() {
       clearInterval(interval)
     }
   }, [])
-
-  if (news.length === 0) return null
 
   return (
     <div className="flex items-center overflow-hidden border-b border-[#f43f5e]/30 bg-[#f43f5e]/10 py-1.5 px-3">
@@ -72,8 +72,13 @@ export default function BreakingNewsTicker() {
         </span>
       </div>
       <div className="flex-1 overflow-hidden relative flex">
-        <div className="whitespace-nowrap animate-marquee flex items-center">
-          {news.map((item, index) => {
+        {news.length === 0 && loading ? (
+           <div className="mx-8 font-mono text-[10px] text-slate-400 animate-pulse uppercase">
+             Syncing global intel feeds...
+           </div>
+        ) : (
+          <div className="whitespace-nowrap animate-marquee flex items-center">
+            {news.map((item, index) => {
             return (
               <span key={index} className="mx-8 font-mono text-[10px] text-slate-200">
                 <span className="text-[#14b8a6] mr-2">[{item.source}]</span>
@@ -85,6 +90,7 @@ export default function BreakingNewsTicker() {
             )
           })}
         </div>
+        )}
       </div>
     </div>
   )
