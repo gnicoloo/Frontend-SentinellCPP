@@ -2,6 +2,7 @@ import { NavLink, Outlet } from 'react-router-dom'
 import { useAuth } from '../context/AuthProvider'
 import CommandPalette from './CommandPalette'
 import SyncStatus from './SyncStatus'
+import BreakingNewsTicker from './viz/BreakingNewsTicker'
 
 const NAV = [
   { to: '/', label: 'Dashboard', code: 'DB', end: true },
@@ -62,8 +63,9 @@ export default function Layout() {
         </div>
       </aside>
 
-      <main className="relative flex-1 overflow-auto">
-        <div className="min-w-0 p-2 pb-16 md:p-4">
+      <main className="relative flex-1 overflow-auto flex flex-col">
+        <BreakingNewsTicker />
+        <div className="min-w-0 p-2 pb-16 md:p-4 flex-1 overflow-auto">
           <Outlet />
         </div>
       </main>
