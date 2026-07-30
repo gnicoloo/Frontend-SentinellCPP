@@ -56,9 +56,9 @@ create index if not exists idx_wallets_suspicious on public.wallets (suspicious_
 -- ---------------------------------------------------------------------------
 create table if not exists public.alerts (
     id bigint generated always as identity primary key,
-    source_table text not null,          -- oracle_moves | suspect_moves | twap_alerts | deception_alerts | cluster_moves | wallet_alerts | osint_leads | mixer_flags
+    source_table text not null,          -- oracle_moves | suspect_moves | twap_alerts | deception_alerts | cluster_moves | wallet_alerts | osint_leads | mixer_flags | arb_opportunities
     source_rowid bigint not null,
-    alert_type text not null,            -- oracle_move | suspect_trade | twap_pattern | deception_alert | cluster_move | wallet_alert | osint_lead | mixer_funding
+    alert_type text not null,            -- oracle_move | suspect_trade | twap_pattern | deception_alert | cluster_move | wallet_alert | osint_lead | mixer_funding | arb_opportunity
     wallet_address text,
     asset_id text,
     market_title text,
@@ -74,7 +74,7 @@ create table if not exists public.alerts (
         alert_type in ('oracle_move', 'suspect_trade', 'twap_pattern',
                        'deception_alert', 'cluster_move', 'trade_anomaly',
                        'wallet_alert', 'hot_wallet', 'forensic_alert', 'intelligence_alert',
-                       'osint_lead', 'mixer_funding')
+                       'osint_lead', 'mixer_funding', 'arb_opportunity')
     )
 );
 create index if not exists idx_alerts_type on public.alerts (alert_type);
@@ -263,7 +263,7 @@ begin
         alert_type in ('oracle_move', 'suspect_trade', 'twap_pattern',
                        'deception_alert', 'cluster_move', 'trade_anomaly',
                        'wallet_alert', 'hot_wallet', 'forensic_alert', 'intelligence_alert',
-                       'osint_lead', 'mixer_funding')
+                       'osint_lead', 'mixer_funding', 'arb_opportunity')
     );
 
     if not exists (select 1 from pg_constraint
