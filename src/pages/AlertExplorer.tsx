@@ -419,6 +419,7 @@ function Inspector({ alert, onClose }: { alert: AlertRow; onClose: () => void })
 
   const fields = Object.entries(alert.payload ?? {})
   const marketUrl = typeof alert.payload?.market_url === 'string' ? alert.payload.market_url : null
+  const newsUrl = typeof alert.payload?.news_url === 'string' ? alert.payload.news_url : (typeof alert.payload?.url === 'string' ? alert.payload.url : null)
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4" onClick={onClose}>
@@ -454,21 +455,35 @@ function Inspector({ alert, onClose }: { alert: AlertRow; onClose: () => void })
           </div>
         </header>
 
-        <div className="border-b border-sentinel-border px-3 py-2">
-          <p className="text-xs text-slate-200">{alert.market_title ?? alert.asset_id ?? 'unknown market'}</p>
-          <p className="mt-0.5 font-mono text-[10px] text-slate-600">
-            {alert.source_table} #{alert.source_rowid} · synced {new Date(alert.created_at).toLocaleString('it-IT')}
-          </p>
-          {marketUrl && (
-            <a
-              href={marketUrl}
-              target="_blank"
-              rel="noreferrer"
-              className="mt-1.5 inline-block border border-sentinel-accent/50 px-2 py-0.5 font-mono text-[10px] uppercase text-sentinel-accent hover:underline"
-            >
-              open market »
-            </a>
-          )}
+        <div className="border-b border-sentinel-border px-3 py-2 flex flex-wrap items-center gap-2">
+          <div>
+            <p className="text-xs text-slate-200">{alert.market_title ?? alert.asset_id ?? 'unknown market'}</p>
+            <p className="mt-0.5 font-mono text-[10px] text-slate-600">
+              {alert.source_table} #{alert.source_rowid} · synced {new Date(alert.created_at).toLocaleString('it-IT')}
+            </p>
+          </div>
+          <div className="ml-auto">
+            {marketUrl && (
+              <a
+                href={marketUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="mt-1.5 inline-block border border-sentinel-accent/50 px-2 py-0.5 font-mono text-[10px] uppercase text-sentinel-accent hover:underline"
+              >
+                open market »
+              </a>
+            )}
+            {newsUrl && (
+              <a
+                href={newsUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="mt-1.5 inline-block border border-[#14b8a6]/50 px-2 py-0.5 font-mono text-[10px] uppercase text-[#14b8a6] hover:underline ml-2"
+              >
+                read source »
+              </a>
+            )}
+          </div>
         </div>
 
         {pattern && <TwapDetail pattern={pattern} />}

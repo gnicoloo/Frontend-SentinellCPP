@@ -25,6 +25,7 @@ import Legend from '../components/viz/Legend'
 import Sparkline from '../components/viz/Sparkline'
 import MiniBar from '../components/viz/MiniBar'
 import Signed from '../components/viz/Signed'
+import OsintFeedPanel from '../components/viz/OsintFeedPanel'
 
 const SEVERE = ['suspect_trade', 'deception_alert']
 
@@ -443,44 +444,49 @@ export default function Dashboard() {
           </Panel>
         </div>
 
-        <div className="grid gap-3">
-          <Panel title="Live tape" meta="unfiltered · newest first" actions={
-            <Link to="/alerts" className="text-[9px] font-mono uppercase tracking-wider text-slate-500 hover:text-sentinel-accent">
-              explorer »
-            </Link>
-          }>
-            <ul className="max-h-[280px] divide-y divide-sentinel-border/40 overflow-y-auto">
-              {tape.length === 0 && <li className="px-3 py-4 text-[10px] font-mono text-slate-600">AWAITING EVENTS…</li>}
-              {tape.map((a) => {
-                const isBuy = a.side.toUpperCase().startsWith('B')
-                return (
-                  <li
-                    key={a.id}
-                    className={`flex items-center gap-2 px-3 py-1.5 ${flashRef.current.has(a.id) ? 'tape-flash' : ''}`}
-                  >
-                    <span
-                      className="w-12 shrink-0 truncate border-l-2 pl-1.5 text-[9px] font-mono font-bold uppercase"
-                      style={{ borderColor: isBuy ? STATUS.good : STATUS.critical, color: isBuy ? STATUS.good : STATUS.critical }}
-                      title={a.side}
+        <div className="grid gap-3 xl:grid-cols-3">
+          <div className="xl:col-span-2">
+            <Panel title="Live tape" meta="unfiltered · newest first" actions={
+              <Link to="/alerts" className="text-[9px] font-mono uppercase tracking-wider text-slate-500 hover:text-sentinel-accent">
+                explorer »
+              </Link>
+            }>
+              <ul className="max-h-[280px] divide-y divide-sentinel-border/40 overflow-y-auto">
+                {tape.length === 0 && <li className="px-3 py-4 text-[10px] font-mono text-slate-600">AWAITING EVENTS…</li>}
+                {tape.map((a) => {
+                  const isBuy = a.side.toUpperCase().startsWith('B')
+                  return (
+                    <li
+                      key={a.id}
+                      className={`flex items-center gap-2 px-3 py-1.5 ${flashRef.current.has(a.id) ? 'tape-flash' : ''}`}
                     >
-                      {isBuy ? 'BUY' : 'SELL'}
-                    </span>
-                    {a.wallet_address ? (
-                      <Link to={`/wallet/${a.wallet_address}`} className="shrink-0 font-mono text-[10px] text-sentinel-accent hover:underline">
-                        {shortAddress(a.wallet_address)}
-                      </Link>
-                    ) : (
-                      <span className="shrink-0 font-mono text-[10px] text-slate-600">—</span>
-                    )}
-                    <span className="num min-w-0 flex-1 truncate text-[10px] text-slate-300" title={a.market_title ?? undefined}>
-                      {compact(a.size)} <span className="text-slate-500">@</span> {a.price.toFixed(3)} <span className="text-slate-600">·</span> {a.market_title ?? a.asset_id ?? 'unknown asset'}
-                    </span>
-                    <span className="num w-8 shrink-0 text-right text-[10px] text-slate-600">{ago(a.timestamp_ms)}</span>
-                  </li>
-                )
-              })}
-            </ul>
-          </Panel>
+                      <span
+                        className="w-12 shrink-0 truncate border-l-2 pl-1.5 text-[9px] font-mono font-bold uppercase"
+                        style={{ borderColor: isBuy ? STATUS.good : STATUS.critical, color: isBuy ? STATUS.good : STATUS.critical }}
+                        title={a.side}
+                      >
+                        {isBuy ? 'BUY' : 'SELL'}
+                      </span>
+                      {a.wallet_address ? (
+                        <Link to={`/wallet/${a.wallet_address}`} className="shrink-0 font-mono text-[10px] text-sentinel-accent hover:underline">
+                          {shortAddress(a.wallet_address)}
+                        </Link>
+                      ) : (
+                        <span className="shrink-0 font-mono text-[10px] text-slate-600">—</span>
+                      )}
+                      <span className="num min-w-0 flex-1 truncate text-[10px] text-slate-300" title={a.market_title ?? undefined}>
+                        {compact(a.size)} <span className="text-slate-500">@</span> {a.price.toFixed(3)} <span className="text-slate-600">·</span> {a.market_title ?? a.asset_id ?? 'unknown asset'}
+                      </span>
+                      <span className="num w-8 shrink-0 text-right text-[10px] text-slate-600">{ago(a.timestamp_ms)}</span>
+                    </li>
+                  )
+                })}
+              </ul>
+            </Panel>
+          </div>
+          <div className="xl:col-span-1">
+            <OsintFeedPanel />
+          </div>
         </div>
 
         <p className="pb-2 text-[9px] font-mono uppercase tracking-wider text-slate-700">

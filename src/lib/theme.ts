@@ -35,6 +35,8 @@ export const SERIES = [
   '#e377c2', // 8 pink
   '#7f7f7f', // 9 gray
   '#bcbd22', // 10 olive
+  '#14b8a6', // 11 teal
+  '#f43f5e', // 12 rose
 ] as const
 
 /**

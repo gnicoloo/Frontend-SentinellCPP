@@ -2,6 +2,15 @@
 -- Tables are fed by scripts/sync_to_supabase.py (service-role key) and read
 -- by the React frontend (anon key, authenticated users only via RLS).
 --
+-- The file is idempotent end to end (create ... if not exists / create or
+-- replace function), so re-running it after a Sentinel upgrade is the normal
+-- way to migrate. It is also meant to be the FULL record of the deployed
+-- schema: the aggregate RPCs at the bottom (alert_buckets, position_totals,
+-- ...) are what the dashboard actually calls, and they lived only in the
+-- hosted database until 2026-07-29 -- a re-provision from this file would
+-- have produced a database the frontend could not query. Anything added by
+-- hand in the SQL editor belongs here too.
+--
 -- Referential integrity: every alert table points at `wallets`, so `wallets`
 -- MUST be created first (the order below is already correct). The sync script
 -- upserts a stub `wallets` row (address only) for every referenced address
@@ -47,9 +56,9 @@ create index if not exists idx_wallets_suspicious on public.wallets (suspicious_
 -- ---------------------------------------------------------------------------
 create table if not exists public.alerts (
     id bigint generated always as identity primary key,
-    source_table text not null,          -- oracle_moves | suspect_moves | twap_alerts | deception_alerts | cluster_moves | wallet_alerts
+    source_table text not null,          -- oracle_moves | suspect_moves | twap_alerts | deception_alerts | cluster_moves | wallet_alerts | osint_leads | mixer_flags
     source_rowid bigint not null,
-    alert_type text not null,            -- oracle_move | suspect_trade | twap_pattern | deception_alert | cluster_move | wallet_alert
+    alert_type text not null,            -- oracle_move | suspect_trade | twap_pattern | deception_alert | cluster_move | wallet_alert | osint_lead | mixer_funding
     wallet_address text,
     asset_id text,
     market_title text,
@@ -64,7 +73,8 @@ create table if not exists public.alerts (
     constraint chk_alerts_type check (
         alert_type in ('oracle_move', 'suspect_trade', 'twap_pattern',
                        'deception_alert', 'cluster_move', 'trade_anomaly',
-                       'wallet_alert', 'hot_wallet', 'forensic_alert', 'intelligence_alert')
+                       'wallet_alert', 'hot_wallet', 'forensic_alert', 'intelligence_alert',
+                       'osint_lead', 'mixer_funding')
     )
 );
 create index if not exists idx_alerts_type on public.alerts (alert_type);
@@ -241,14 +251,20 @@ begin
             on delete set null on update cascade;
     end if;
 
-    if not exists (select 1 from pg_constraint
-                   where conname = 'chk_alerts_type' and conrelid = 'public.alerts'::regclass) then
-        alter table public.alerts add constraint chk_alerts_type check (
-            alert_type in ('oracle_move', 'suspect_trade', 'twap_pattern',
-                           'deception_alert', 'cluster_move', 'trade_anomaly',
-                           'wallet_alert', 'hot_wallet', 'forensic_alert', 'intelligence_alert')
-        );
+    -- Unlike the FKs, this one is REPLACED rather than only added: a database
+    -- created before the OSINT module already has a chk_alerts_type, and the
+    -- plain "add if missing" would leave it rejecting the new alert types
+    -- (which fails the whole sync batch, not just the offending row).
+    if exists (select 1 from pg_constraint
+               where conname = 'chk_alerts_type' and conrelid = 'public.alerts'::regclass) then
+        alter table public.alerts drop constraint chk_alerts_type;
     end if;
+    alter table public.alerts add constraint chk_alerts_type check (
+        alert_type in ('oracle_move', 'suspect_trade', 'twap_pattern',
+                       'deception_alert', 'cluster_move', 'trade_anomaly',
+                       'wallet_alert', 'hot_wallet', 'forensic_alert', 'intelligence_alert',
+                       'osint_lead', 'mixer_funding')
+    );
 
     if not exists (select 1 from pg_constraint
                    where conname = 'fk_deception_wallet' and conrelid = 'public.deception_alerts'::regclass) then

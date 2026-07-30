@@ -180,6 +180,8 @@ export const ALERT_TYPE_LABELS: Record<string, string> = {
   hot_wallet: 'Hot Wallet',
   forensic_alert: 'Forensic Alert',
   intelligence_alert: 'Intel Alert',
+  osint_lead: 'OSINT Lead',
+  mixer_funding: 'Mixer Funding',
 }
 
 /**
@@ -198,6 +200,8 @@ export const ALERT_TYPE_ORDER = [
   'hot_wallet',
   'forensic_alert',
   'intelligence_alert',
+  'osint_lead',
+  'mixer_funding',
 ] as const
 
 export const ALERT_TYPE_COLORS: Record<string, string> = Object.fromEntries(
